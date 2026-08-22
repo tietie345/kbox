@@ -268,6 +268,44 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["id"]
             }),
         },
+        ToolDefinition {
+            name: "list_collections",
+            description: "列出全部目录树（Collection，含层级、说明、下级对象）。AI 整理前先了解现有目录结构。",
+            input_schema: json!({ "type": "object", "properties": {} }),
+        },
+        ToolDefinition {
+            name: "create_collection",
+            description: "在知识库中建立目录（Collection），按「一级/二级/...」路径自动逐级创建。仅允许在授权范围内创建。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "目录路径，如 工作/KBOX" },
+                    "description": { "type": "string", "description": "目录语义说明（可选）" }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: "move_object",
+            description: "把对象移动到指定目录（Collection）下。目标目录必须在授权范围内。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "object_id": { "type": "string" },
+                    "collection_id": { "type": "string", "description": "目标目录 id" }
+                },
+                "required": ["object_id", "collection_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "archive_object",
+            description: "把对象移动到「归档」目录（软归档，并非永久删除）。仅允许归档授权范围内的对象。",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }),
+        },
     ]
 }
 
@@ -306,6 +344,10 @@ pub fn execute_tool(kb: &KnowledgeBase, call: &ToolCall, scope: &TaskScope) -> T
         "list_groups" => tool_list_groups(kb),
         "list_tags" => tool_list_tags(kb),
         "get_object_preview" => tool_get_object_preview(kb, &call.arguments),
+        "list_collections" => tool_list_collections(kb),
+        "create_collection" => tool_create_collection(kb, &call.arguments, scope),
+        "move_object" => tool_move_object(kb, &call.arguments, scope),
+        "archive_object" => tool_archive_object(kb, &call.arguments, scope),
         other => Err(format!("未知工具: {other}")),
     };
     match result {
@@ -650,6 +692,142 @@ fn tool_get_object_preview(kb: &KnowledgeBase, args: &Value) -> ToolOut {
     }
 }
 
+fn tool_list_collections(kb: &KnowledgeBase) -> ToolOut {
+    match kb.get_collection_tree() {
+        Ok(tree) => {
+            if tree.is_empty() {
+                Ok("知识库暂无目录。".to_string())
+            } else {
+                let mut lines = Vec::new();
+                let mut total = 0_usize;
+                fn walk(node: &CollectionNode, depth: usize, lines: &mut Vec<String>) {
+                    let desc = if node.description.is_empty() {
+                        String::new()
+                    } else {
+                        format!("（{}）", node.description)
+                    };
+                    lines.push(format!(
+                        "{}- 📁 {} (id: {}){} · {} 个对象",
+                        "  ".repeat(depth),
+                        node.name,
+                        node.id,
+                        desc,
+                        node.objects.len()
+                    ));
+                    for child in &node.children {
+                        walk(child, depth + 1, lines);
+                    }
+                }
+                fn count(node: &CollectionNode) -> usize {
+                    1 + node.children.iter().map(count).sum::<usize>()
+                }
+                for root in &tree {
+                    walk(root, 0, &mut lines);
+                    total += count(root);
+                }
+                Ok(format!(
+                    "目录结构（共 {total} 个目录）：\n{}",
+                    lines.join("\n")
+                ))
+            }
+        }
+        Err(e) => Err(format!("获取目录失败: {e}")),
+    }
+}
+
+/// 校验目标目录 path 是否在授权 Collection 范围内（全局范围不限）。
+fn path_within_scope(kb: &KnowledgeBase, scope: &TaskScope, path: &str) -> Result<(), String> {
+    let TaskScope::Collection { id } = scope else {
+        return Ok(());
+    };
+    let conn = kb.conn().map_err(|e| format!("数据库连接失败: {e}"))?;
+    let scope_path = db::collection_path(&conn, id).map_err(|e| e.to_string())?;
+    if path == scope_path || path.starts_with(&format!("{scope_path}/")) {
+        Ok(())
+    } else {
+        Err(format!("目录「{path}」超出授权范围「{scope_path}」"))
+    }
+}
+
+/// 校验目标 Collection id 是否在授权范围内（全局范围不限）。
+fn collection_within_scope(
+    kb: &KnowledgeBase,
+    scope: &TaskScope,
+    collection_id: &str,
+) -> Result<(), String> {
+    let TaskScope::Collection { id } = scope else {
+        return Ok(());
+    };
+    let conn = kb.conn().map_err(|e| format!("数据库连接失败: {e}"))?;
+    let scope_path = db::collection_path(&conn, id).map_err(|e| e.to_string())?;
+    let target_path = db::collection_path(&conn, collection_id).map_err(|e| e.to_string())?;
+    if target_path == scope_path || target_path.starts_with(&format!("{scope_path}/")) {
+        Ok(())
+    } else {
+        Err(format!(
+            "目标目录「{target_path}」超出授权范围「{scope_path}」"
+        ))
+    }
+}
+
+fn tool_create_collection(kb: &KnowledgeBase, args: &Value, scope: &TaskScope) -> ToolOut {
+    let path = args["path"].as_str().unwrap_or("").trim();
+    if path.is_empty() {
+        return Err("缺少 path 参数".to_string());
+    }
+    path_within_scope(kb, scope, path)?;
+    let description = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match kb.ensure_collection_path(path, description, "agent") {
+        Ok(id) => Ok(format!("已建立目录「{path}」 (id: {id})")),
+        Err(e) => Err(format!("建立目录失败: {e}")),
+    }
+}
+
+fn tool_move_object(kb: &KnowledgeBase, args: &Value, scope: &TaskScope) -> ToolOut {
+    let object_id = args["object_id"].as_str().unwrap_or("");
+    let collection_id = args["collection_id"].as_str().unwrap_or("");
+    if object_id.is_empty() {
+        return Err("缺少 object_id 参数".to_string());
+    }
+    if collection_id.is_empty() {
+        return Err("缺少 collection_id 参数".to_string());
+    }
+    scope.ensure_object_in_scope(kb, object_id)?;
+    collection_within_scope(kb, scope, collection_id)?;
+    match kb.move_object_to_collection(object_id, collection_id) {
+        Ok(()) => Ok(format!(
+            "已移动对象「{object_id}」到目录 (id: {collection_id})"
+        )),
+        Err(e) => Err(format!("移动失败: {e}")),
+    }
+}
+
+fn tool_archive_object(kb: &KnowledgeBase, args: &Value, scope: &TaskScope) -> ToolOut {
+    let id = args["id"].as_str().unwrap_or("");
+    if id.is_empty() {
+        return Err("缺少 id 参数".to_string());
+    }
+    scope.ensure_object_in_scope(kb, id)?;
+    let archive_path = match scope {
+        TaskScope::KnowledgeBase => "归档".to_string(),
+        TaskScope::Collection { id } => {
+            let conn = kb.conn().map_err(|e| format!("数据库连接失败: {e}"))?;
+            let path = db::collection_path(&conn, id).map_err(|e| e.to_string())?;
+            format!("{path}/归档")
+        }
+    };
+    let collection_id = kb
+        .ensure_collection_path(&archive_path, "归档", "agent")
+        .map_err(|e| format!("建立归档目录失败: {e}"))?;
+    match kb.move_object_to_collection(id, &collection_id) {
+        Ok(()) => Ok(format!("已归档对象「{id}」到「{archive_path}」")),
+        Err(e) => Err(format!("归档失败: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,5 +974,102 @@ mod tests {
         );
         assert!(!result.is_error, "{}", result.content);
         assert!(result.content.contains("对象总数"));
+    }
+
+    #[test]
+    fn create_collection_respects_scope() {
+        let (_tmp, kb) = setup_vault();
+        let col_id = kb
+            .ensure_collection_path("项目/KBOX", "测试目录", "human")
+            .expect("collection");
+        let scope = TaskScope::Collection { id: col_id };
+
+        let ok = execute_tool(
+            &kb,
+            &ToolCall {
+                name: "create_collection".into(),
+                arguments: json!({ "path": "项目/KBOX/技术", "description": "后端" }),
+            },
+            &scope,
+        );
+        assert!(!ok.is_error, "范围内建目录应成功: {}", ok.content);
+
+        let denied = execute_tool(
+            &kb,
+            &ToolCall {
+                name: "create_collection".into(),
+                arguments: json!({ "path": "项目/其他/越界" }),
+            },
+            &scope,
+        );
+        assert!(denied.is_error, "越界目录应被拒绝");
+        assert!(
+            denied.content.contains("超出授权范围"),
+            "{}",
+            denied.content
+        );
+    }
+
+    #[test]
+    fn move_object_respects_scope() {
+        let (_tmp, kb) = setup_vault();
+        let in_obj = kb
+            .create_note_as("对象A", "concept", "收件箱", "human")
+            .expect("A");
+        let out_obj = kb
+            .create_note_as("对象B", "concept", "收件箱", "human")
+            .expect("B");
+        let col_id = kb
+            .ensure_collection_path("项目/KBOX", "测试目录", "human")
+            .expect("collection");
+        kb.move_object_to_collection(&in_obj.id, &col_id)
+            .expect("move");
+        let scope = TaskScope::Collection { id: col_id.clone() };
+
+        let within = execute_tool(
+            &kb,
+            &ToolCall {
+                name: "move_object".into(),
+                arguments: json!({ "object_id": in_obj.id, "collection_id": col_id }),
+            },
+            &scope,
+        );
+        assert!(!within.is_error, "scope 内对象可移动: {}", within.content);
+
+        let denied = execute_tool(
+            &kb,
+            &ToolCall {
+                name: "move_object".into(),
+                arguments: json!({ "object_id": out_obj.id, "collection_id": col_id }),
+            },
+            &scope,
+        );
+        assert!(denied.is_error, "越界对象应被拒绝");
+        assert!(
+            denied.content.contains("不在当前整理作用域内"),
+            "{}",
+            denied.content
+        );
+    }
+
+    #[test]
+    fn archive_object_moves_to_archive_collection() {
+        let (_tmp, kb) = setup_vault();
+        let obj = kb
+            .create_note_as("对象A", "concept", "收件箱", "human")
+            .expect("A");
+        let result = execute_tool(
+            &kb,
+            &ToolCall {
+                name: "archive_object".into(),
+                arguments: json!({ "id": obj.id }),
+            },
+            &TaskScope::KnowledgeBase,
+        );
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("归档"), "{}", result.content);
+        // 归档后应位于「归档」目录
+        let detail = kb.get_object_detail(&obj.id).expect("detail");
+        assert_eq!(detail.0.group_name, "归档");
     }
 }

@@ -1,3 +1,4 @@
+use kb_core::agent_tools::{execute_tool, tool_definitions, TaskScope, ToolCall, ToolResult};
 use kb_core::{db, KnowledgeBase};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
@@ -292,10 +293,11 @@ fn saved_api_key() -> Result<String, String> {
         .map_err(|_| "尚未配置 API Key".to_string())
 }
 
-async fn chat(
+async fn chat_request(
     vault_path: &Path,
     messages: serde_json::Value,
     max_tokens: u32,
+    tools: Option<&Value>,
 ) -> Result<ProviderResponse, String> {
     let config = load_config(vault_path);
     if config.model.trim().is_empty() {
@@ -308,14 +310,19 @@ async fn chat(
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
+    let mut body = json!({
+        "model": config.model,
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": max_tokens
+    });
+    if let Some(tools) = tools {
+        body["tools"] = tools.clone();
+        body["tool_choice"] = json!("auto");
+    }
     let response = client
         .post(chat_completions_url(&config.base_url))
-        .json(&json!({
-            "model": config.model,
-            "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": max_tokens
-        }))
+        .json(&body)
         .send()
         .await
         .map_err(|e| format!("模型请求失败: {e}"))?;
@@ -328,6 +335,14 @@ async fn chat(
     let value: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("模型响应不是有效 JSON: {e}"))?;
     Ok(parse_chat_response(&value))
+}
+
+async fn chat(
+    vault_path: &Path,
+    messages: serde_json::Value,
+    max_tokens: u32,
+) -> Result<ProviderResponse, String> {
+    chat_request(vault_path, messages, max_tokens, None).await
 }
 
 pub async fn test_connection(vault_path: &Path) -> Result<String, String> {
@@ -625,9 +640,266 @@ where
     })
 }
 
+// ---------------------------------------------------------------------------
+// PR3：多轮 Tool Calling Runner
+// ---------------------------------------------------------------------------
+
+/// 首轮工具请求因 Provider 不支持 tools 而失败时返回的哨兵错误，
+/// 调度器据此回退到单次 JSON 规划（organize_knowledge_base）。
+const FALLBACK_SENTINEL: &str = "__AGENT_LOOP_FALLBACK__";
+
+/// 将共享 Tool Registry 转成 OpenAI-compatible 的 `tools` 数组。
+pub fn build_tools_json() -> Value {
+    let tools: Vec<Value> = tool_definitions()
+        .iter()
+        .map(|d| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": d.name,
+                    "description": d.description,
+                    "parameters": d.input_schema.clone(),
+                }
+            })
+        })
+        .collect();
+    json!(tools)
+}
+
+fn build_assistant_message(response: &ProviderResponse) -> Value {
+    let tool_calls: Vec<Value> = response
+        .tool_calls
+        .iter()
+        .map(|tc| {
+            json!({
+                "id": tc.id,
+                "type": "function",
+                "function": { "name": tc.function.name, "arguments": tc.function.arguments },
+            })
+        })
+        .collect();
+    let mut msg = json!({
+        "role": "assistant",
+        "content": if response.content.is_empty() { Value::Null } else { json!(response.content) },
+    });
+    if !tool_calls.is_empty() {
+        msg["tool_calls"] = json!(tool_calls);
+    }
+    msg
+}
+
+/// 生成给用户日志看的可读动作描述（入参 + 成败标记）。
+fn describe_tool_call(name: &str, args: &Value, result: &ToolResult) -> String {
+    let target = match name {
+        "create_collection" => format!("建立目录：{}", args["path"].as_str().unwrap_or("")),
+        "move_object" => format!(
+            "移动 {} → 目录 {}",
+            args["object_id"].as_str().unwrap_or(""),
+            args["collection_id"].as_str().unwrap_or("")
+        ),
+        "archive_object" => format!("归档 {}", args["id"].as_str().unwrap_or("")),
+        "search" => format!("搜索：{}", args["query"].as_str().unwrap_or("")),
+        "get_object" | "get_object_preview" | "get_relations" | "get_incoming_relations" => {
+            format!("读取对象 {}", args["id"].as_str().unwrap_or(""))
+        }
+        "update_content" => format!("更新内容 {}", args["id"].as_str().unwrap_or("")),
+        "link_objects" => format!(
+            "关联 {} ↔ {}",
+            args["from_id"].as_str().unwrap_or(""),
+            args["to_id"].as_str().unwrap_or("")
+        ),
+        "delete_object" => format!("删除 {}", args["id"].as_str().unwrap_or("")),
+        "create_note" => format!("新建笔记 {}", args["title"].as_str().unwrap_or("")),
+        "ingest_file" => format!("入库 {}", args["file_path"].as_str().unwrap_or("")),
+        "ingest_url" => format!("入库 URL {}", args["url"].as_str().unwrap_or("")),
+        _ => name.to_string(),
+    };
+    let flag = if result.is_error { "⚠ 失败" } else { "✓" };
+    format!("{flag} {target}")
+}
+
+/// 执行多轮 Tool Calling。兼容模型可连续执行"搜索 → 读取 → 建目录 → 移动 → 建关系"等动作；
+/// 每个动作先写 `ai_task_actions` 再通过 `on_action` 推送；达到轮次上限以可诊断摘要结束。
+pub async fn run_agent_loop<F>(
+    vault_path: &Path,
+    task_id: &str,
+    collection_id: Option<&str>,
+    instruction: &str,
+    cancelled: Arc<AtomicBool>,
+    mut on_action: F,
+) -> Result<OrganizeResult, String>
+where
+    F: FnMut(String),
+{
+    ensure_not_cancelled(&cancelled)?;
+    let config = load_config(vault_path);
+    if config.model.trim().is_empty() {
+        return Err("请先在设置中配置模型".to_string());
+    }
+    let kb = KnowledgeBase::new(vault_path);
+    let scope = match collection_id {
+        Some(id) => TaskScope::Collection { id: id.to_string() },
+        None => TaskScope::KnowledgeBase,
+    };
+    let scope_description = match &scope {
+        TaskScope::KnowledgeBase => "整理整个知识库。".to_string(),
+        TaskScope::Collection { id } => {
+            let conn = kb.conn().map_err(|e| e.to_string())?;
+            let path = db::collection_path(&conn, id).map_err(|e| e.to_string())?;
+            format!("仅整理目录「{path}」及其子目录，只能在授权范围内操作。")
+        }
+    };
+    let tools = build_tools_json();
+    let system = format!(
+        "你是 KBOX 内置 AI 知识整理 Agent。使用提供的工具完成用户的整理要求。\n不得虚构对象 ID；只能操作授权范围内的内容；不永久删除，需要归档时用 archive_object 软归档。\n{scope_description}"
+    );
+    let mut messages: Vec<Value> = vec![
+        json!({ "role": "system", "content": system }),
+        json!({ "role": "user", "content": instruction.trim() }),
+    ];
+    let max_rounds = config.max_tool_rounds.clamp(1, 32) as usize;
+    let mut round = 0_usize;
+    let mut actions: Vec<String> = Vec::new();
+    let (mut moved, mut created, mut archived) = (0, 0, 0);
+
+    loop {
+        ensure_not_cancelled(&cancelled)?;
+        let first_round = round == 0;
+        let request = chat_request(vault_path, json!(messages), 12000, Some(&tools));
+        let response = tokio::select! {
+            resp = request => match resp {
+                Ok(r) => r,
+                Err(_e) if first_round => return Err(FALLBACK_SENTINEL.to_string()),
+                Err(e) => return Err(e),
+            },
+            _ = wait_for_cancellation(Arc::clone(&cancelled)) => return Err(CANCELLED_ERROR.to_string()),
+        };
+        ensure_not_cancelled(&cancelled)?;
+        messages.push(build_assistant_message(&response));
+
+        if response.tool_calls.is_empty() || response.finish_reason == "stop" {
+            let summary = if response.content.trim().is_empty() {
+                "AI 已完成整理".to_string()
+            } else {
+                response.content.trim().to_string()
+            };
+            on_action(format!("完成：{summary}"));
+            return Ok(OrganizeResult {
+                task_id: task_id.to_string(),
+                summary,
+                actions,
+                moved_objects: moved,
+                created_directories: created,
+                archived_objects: archived,
+                removed_directories: 0,
+            });
+        }
+
+        round += 1;
+        if round > max_rounds {
+            let summary = format!(
+                "已达到最大工具调用轮次（{max_rounds}），已完成的动作保留，未开始的动作不再执行。"
+            );
+            on_action(summary.clone());
+            return Ok(OrganizeResult {
+                task_id: task_id.to_string(),
+                summary,
+                actions,
+                moved_objects: moved,
+                created_directories: created,
+                archived_objects: archived,
+                removed_directories: 0,
+            });
+        }
+
+        let mut tool_results: Vec<Value> = Vec::new();
+        for tool_call in &response.tool_calls {
+            ensure_not_cancelled(&cancelled)?;
+            let name = tool_call.function.name.clone();
+            let args: Value =
+                serde_json::from_str(&tool_call.function.arguments).unwrap_or(Value::Null);
+            let call = ToolCall {
+                name: name.clone(),
+                arguments: args.clone(),
+            };
+            let result = execute_tool(&kb, &call, &scope);
+            let description = describe_tool_call(&name, &args, &result);
+            let object_id = args
+                .get("object_id")
+                .or_else(|| args.get("id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let collection_id = args
+                .get("collection_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            kb.add_ai_task_action(
+                task_id,
+                &name,
+                object_id.as_deref(),
+                collection_id.as_deref(),
+                &description,
+            )
+            .map_err(|e| e.to_string())?;
+            on_action(description.clone());
+            actions.push(description);
+            match name.as_str() {
+                "create_collection" => created += 1,
+                "move_object" => moved += 1,
+                "archive_object" => archived += 1,
+                _ => {}
+            }
+            tool_results.push(json!({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result.content,
+            }));
+        }
+        messages.extend(tool_results);
+    }
+}
+
+/// 调度器：优先走多轮 Tool Calling；首轮因 Provider 不支持 tools 而失败时回退到单次 JSON 规划。
+pub async fn organize_with_agent<F>(
+    vault_path: &Path,
+    task_id: &str,
+    collection_id: Option<&str>,
+    instruction: &str,
+    cancelled: Arc<AtomicBool>,
+    mut on_action: F,
+) -> Result<OrganizeResult, String>
+where
+    F: FnMut(String),
+{
+    match run_agent_loop(
+        vault_path,
+        task_id,
+        collection_id,
+        instruction,
+        Arc::clone(&cancelled),
+        &mut on_action,
+    )
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(error) if error == FALLBACK_SENTINEL => {
+            organize_knowledge_base(
+                vault_path,
+                task_id,
+                collection_id,
+                instruction,
+                cancelled,
+                &mut on_action,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_chat_response, resolved_plan_path};
+    use super::{build_tools_json, parse_chat_response, resolved_plan_path};
 
     #[test]
     fn scoped_plan_paths_cannot_escape_the_selected_collection() {
@@ -696,5 +968,24 @@ mod tests {
         assert_eq!(parsed.content, "");
         assert!(parsed.tool_calls.is_empty());
         assert_eq!(parsed.finish_reason, "");
+    }
+
+    #[test]
+    fn build_tools_json_is_openai_function_wrapped() {
+        let tools = build_tools_json();
+        let arr = tools.as_array().expect("tools 应为数组");
+        let names: Vec<&str> = arr
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or(""))
+            .collect();
+        assert!(names.contains(&"search"));
+        assert!(names.contains(&"create_collection"));
+        assert!(names.contains(&"move_object"));
+        assert!(names.contains(&"archive_object"));
+        // 每个条目都应是 function 类型且带 parameters
+        for t in arr {
+            assert_eq!(t["type"], "function");
+            assert!(t["function"]["parameters"].is_object());
+        }
     }
 }

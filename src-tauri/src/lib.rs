@@ -263,7 +263,7 @@ fn start_ai_organize(
         let vault_path = resolve_vault_path();
         let action_app = app.clone();
         let action_task_id = spawned_task_id.clone();
-        let outcome = ai::organize_knowledge_base(
+        let outcome = ai::organize_with_agent(
             &vault_path,
             &spawned_task_id,
             collection_id.as_deref(),
