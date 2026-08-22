@@ -1,7 +1,7 @@
 use kb_core::{db, KnowledgeBase};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -35,6 +35,53 @@ pub struct AiConfigView {
     pub headers: HashMap<String, String>,
     pub max_tool_rounds: u32,
     pub api_key_configured: bool,
+}
+
+/// OpenAI-compatible 的 tool_call 结构。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderToolCallFunction {
+    pub name: String,
+    /// 参数为 JSON 字符串
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderToolCall {
+    pub id: String,
+    pub function: ProviderToolCallFunction,
+}
+
+/// 结构化响应：内容、工具调用与结束原因。
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderResponse {
+    pub content: String,
+    pub tool_calls: Vec<ProviderToolCall>,
+    pub finish_reason: String,
+}
+
+/// 从 Chat Completions 响应 JSON 中解析 content / tool_calls / finish_reason。
+/// 抽为纯函数，便于用本地模拟响应做单元测试（不依赖真实模型 / API Key）。
+fn parse_chat_response(value: &Value) -> ProviderResponse {
+    let message = value.pointer("/choices/0/message");
+    let content = message
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    let tool_calls = message
+        .and_then(|m| m.get("tool_calls").cloned())
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let finish_reason = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    ProviderResponse {
+        content,
+        tool_calls,
+        finish_reason,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,7 +296,7 @@ async fn chat(
     vault_path: &Path,
     messages: serde_json::Value,
     max_tokens: u32,
-) -> Result<String, String> {
+) -> Result<ProviderResponse, String> {
     let config = load_config(vault_path);
     if config.model.trim().is_empty() {
         return Err("请先在设置中配置模型".to_string());
@@ -280,11 +327,7 @@ async fn chat(
     }
     let value: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("模型响应不是有效 JSON: {e}"))?;
-    value
-        .pointer("/choices/0/message/content")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| "模型响应缺少 choices[0].message.content".to_string())
+    Ok(parse_chat_response(&value))
 }
 
 pub async fn test_connection(vault_path: &Path) -> Result<String, String> {
@@ -297,6 +340,7 @@ pub async fn test_connection(vault_path: &Path) -> Result<String, String> {
         16,
     )
     .await
+    .map(|r| r.content)
 }
 
 pub async fn edit_text(
@@ -328,6 +372,7 @@ pub async fn edit_text(
         4096,
     )
     .await
+    .map(|r| r.content)
 }
 
 fn extract_json_object(text: &str) -> Result<&str, String> {
@@ -445,7 +490,7 @@ where
         _ = wait_for_cancellation(Arc::clone(&cancelled)) => return Err(CANCELLED_ERROR.to_string()),
     };
     ensure_not_cancelled(&cancelled)?;
-    let plan: OrganizePlan = match serde_json::from_str(extract_json_object(&response)?) {
+    let plan: OrganizePlan = match serde_json::from_str(extract_json_object(&response.content)?) {
         Ok(plan) => plan,
         Err(error) => {
             let message = format!("无法解析模型生成的整理方案: {error}");
@@ -582,7 +627,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::resolved_plan_path;
+    use super::{parse_chat_response, resolved_plan_path};
 
     #[test]
     fn scoped_plan_paths_cannot_escape_the_selected_collection() {
@@ -600,5 +645,56 @@ mod tests {
         );
         assert!(resolved_plan_path(Some("工作/KBOX"), "").is_none());
         assert!(resolved_plan_path(None, "a/b/c/d/e").is_none());
+    }
+
+    #[test]
+    fn parse_chat_response_extracts_content_and_finish_reason() {
+        let value = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "你好，KBOX" },
+                "finish_reason": "stop"
+            }]
+        });
+        let parsed = parse_chat_response(&value);
+        assert_eq!(parsed.content, "你好，KBOX");
+        assert_eq!(parsed.finish_reason, "stop");
+        assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn parse_chat_response_extracts_tool_calls() {
+        let value = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "search", "arguments": "{\"query\":\"信号\"}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let parsed = parse_chat_response(&value);
+        assert_eq!(parsed.content, "");
+        assert_eq!(parsed.finish_reason, "tool_calls");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id, "call_1");
+        assert_eq!(parsed.tool_calls[0].function.name, "search");
+        assert_eq!(
+            parsed.tool_calls[0].function.arguments,
+            "{\"query\":\"信号\"}"
+        );
+    }
+
+    #[test]
+    fn parse_chat_response_handles_empty_or_missing_message() {
+        let value = serde_json::json!({ "choices": [] });
+        let parsed = parse_chat_response(&value);
+        assert_eq!(parsed.content, "");
+        assert!(parsed.tool_calls.is_empty());
+        assert_eq!(parsed.finish_reason, "");
     }
 }
