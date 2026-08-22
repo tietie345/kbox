@@ -1,0 +1,20 @@
+[package]
+name = "kb-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+rusqlite.workspace = true
+tracing.workspace = true
+sha2 = "0.10"
+walkdir = "2"
+regex = "1"
+chrono = "0.4"
+hex = "0.4"
+pdf-extract = "0.7"
+quick-xml = "0.41"
+zip = "0.6"

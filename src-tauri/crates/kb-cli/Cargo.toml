@@ -1,0 +1,19 @@
+[package]
+name = "kb-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "kb"
+path = "src/main.rs"
+
+[dependencies]
+kb-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dirs = "5"
+rusqlite.workspace = true

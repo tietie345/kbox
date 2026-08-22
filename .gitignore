@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+target/
+dist/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env
+.env
+.env.local
+
+# Logs
+*.log
+
+# Vault data
+src-tauri/dev-vault/
+dev-vault/
+migration-backups/
