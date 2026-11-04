@@ -18,3 +18,6 @@ hex = "0.4"
 pdf-extract = "0.7"
 quick-xml = "0.41"
 zip = "0.6"
+reqwest = { version = "0.13", features = ["blocking"] }
+scraper = "0.24"
+url = "2"

@@ -2,9 +2,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::error::Result;
+use crate::error::{KbError, Result};
 use crate::model::{
-    AiTask, AiTaskAction, CollectionNode, GroupNode, Object, ObjectSummary, Relation, VaultStats,
+    AiTask, AiTaskAction, CollectionNode, ConceptNoteTask, GroupNode, Object, ObjectSummary,
+    Relation, VaultStats,
 };
 use serde_json;
 
@@ -17,6 +18,30 @@ pub fn open(path: &Path) -> Result<Connection> {
 }
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
+    // 版本 7 起，迁移只执行一次。正常启动不重建触发器，也不扫描全文索引。
+    let has_version_table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_version_table {
+        let version: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |row| row.get(0),
+        )?;
+        if version >= 7 {
+            return Ok(());
+        }
+    }
+    // DDL、历史数据补齐和版本号一起提交，失败后下次启动可安全重试。
+    let tx = conn.unchecked_transaction()?;
+    migrate_schema(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -64,6 +89,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             source_id TEXT NOT NULL,
             target_id TEXT NOT NULL,
             relation_type TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'automatic',
             created_at INTEGER NOT NULL,
             PRIMARY KEY (source_id, target_id, relation_type),
             FOREIGN KEY (source_id) REFERENCES objects(id) ON DELETE CASCADE,
@@ -81,14 +107,29 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             tokenize='unicode61 remove_diacritics 2'
         );
 
+        -- 中文等无空格语言使用 trigram 索引支持稳定的子串检索；短于 3 字符
+        -- 的查询仍由安全 LIKE 兜底。
+        CREATE VIRTUAL TABLE IF NOT EXISTS objects_fts_cjk USING fts5(
+            id UNINDEXED,
+            title,
+            content,
+            tags,
+            tokenize='trigram'
+        );
+
         -- 只同步 title 和 format_detail，content 由 DAO 手动管理
-        CREATE TRIGGER IF NOT EXISTS objects_ai AFTER INSERT ON objects BEGIN
+        DROP TRIGGER IF EXISTS objects_ai;
+        CREATE TRIGGER objects_ai AFTER INSERT ON objects BEGIN
             INSERT INTO objects_fts(id, title, content, tags, format_detail)
             VALUES (new.id, new.title, '', '', new.format);
+            INSERT INTO objects_fts_cjk(id, title, content, tags)
+            VALUES (new.id, new.title, '', '');
         END;
 
-        CREATE TRIGGER IF NOT EXISTS objects_ad AFTER DELETE ON objects BEGIN
+        DROP TRIGGER IF EXISTS objects_ad;
+        CREATE TRIGGER objects_ad AFTER DELETE ON objects BEGIN
             DELETE FROM objects_fts WHERE id = old.id;
+            DELETE FROM objects_fts_cjk WHERE id = old.id;
         END;
 
         -- 旧版本在任意 metadata 更新时重建 FTS 行，导致正文被清空。
@@ -98,6 +139,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             UPDATE objects_fts
             SET title = new.title, format_detail = new.format
             WHERE id = old.id;
+            UPDATE objects_fts_cjk SET title = new.title WHERE id = old.id;
         END;
 
         CREATE TABLE IF NOT EXISTS operation_log (
@@ -115,6 +157,17 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_oplog_timestamp ON operation_log(timestamp);
         CREATE INDEX IF NOT EXISTS idx_oplog_object ON operation_log(object_id);
         CREATE INDEX IF NOT EXISTS idx_oplog_status ON operation_log(status);
+
+        CREATE TABLE IF NOT EXISTS object_embeddings (
+            object_id TEXT NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
+            model TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            vector TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (object_id, model)
+        );
+        CREATE INDEX IF NOT EXISTS idx_object_embeddings_model
+            ON object_embeddings(model);
 
         CREATE TABLE IF NOT EXISTS trash (
             object_id TEXT PRIMARY KEY,
@@ -173,7 +226,42 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_ai_task_actions_task ON ai_task_actions(task_id);
+
+        CREATE TABLE IF NOT EXISTS concept_note_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            object_id TEXT NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
+            content_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT,
+            enqueued_at INTEGER NOT NULL,
+            finished_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_concept_queue_status ON concept_note_queue(status);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_queue_object_pending
+            ON concept_note_queue(object_id) WHERE status IN ('pending', 'running');
         ",
+    )?;
+    let relation_columns = conn
+        .prepare("PRAGMA table_info(relations)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !relation_columns.iter().any(|name| name == "source") {
+        conn.execute(
+            "ALTER TABLE relations ADD COLUMN source TEXT NOT NULL DEFAULT 'automatic'",
+            [],
+        )?;
+    }
+    // 历史上只有这三类关系明确由用户创建；其余旧记录按自动关系处理。
+    conn.execute(
+        "UPDATE relations SET source = 'manual' WHERE relation_type IN ('depends_on', 'part_of', 'implements')",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO objects_fts_cjk(id, title, content, tags)
+         SELECT f.id, f.title, f.content, f.tags FROM objects_fts f
+         WHERE f.id NOT IN (SELECT id FROM objects_fts_cjk WHERE id IS NOT NULL)",
+        [],
     )?;
     let has_explicit_column = conn
         .prepare("PRAGMA table_info(groups)")?
@@ -196,7 +284,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     sync_legacy_collections(conn)?;
     conn.execute(
         "INSERT OR IGNORE INTO schema_version (version, applied_at)
-         VALUES (4, CAST(strftime('%s', 'now') AS INTEGER))",
+         VALUES (7, CAST(strftime('%s', 'now') AS INTEGER))",
         [],
     )?;
     Ok(())
@@ -264,6 +352,10 @@ pub fn create_object(conn: &Connection, obj: &Object) -> Result<()> {
     // 触发器已插入基础 FTS 记录（content 为空），手动更新 content
     conn.execute(
         "UPDATE objects_fts SET content = ?1 WHERE id = ?2",
+        params!["", obj.id],
+    )?;
+    conn.execute(
+        "UPDATE objects_fts_cjk SET content = ?1 WHERE id = ?2",
         params!["", obj.id],
     )?;
     let after = serde_json::to_string(obj).unwrap_or_default();
@@ -341,35 +433,51 @@ fn list_objects_with_status(conn: &Connection, include_deleted: bool) -> Result<
 }
 
 pub fn update_object_content(
-    conn: &Connection,
+    conn: &mut Connection,
     id: &str,
     title: &str,
     content: &str,
     file_hash: Option<&str>,
     file_size: i64,
 ) -> Result<()> {
-    let before = get_object(conn, id)?.and_then(|obj| serde_json::to_string(&obj).ok());
+    // Object row, both FTS indexes, and the operation log must commit together.
+    // The caller handles file/index.md rollback when this transaction fails.
+    let tx = conn.transaction()?;
+    let before = get_object(&tx, id)?.and_then(|obj| serde_json::to_string(&obj).ok());
+    let before_content = tx
+        .query_row(
+            "SELECT content FROM objects_fts WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_default();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    conn.execute(
+    tx.execute(
         "UPDATE objects SET title = ?1, file_hash = ?2, file_size = ?3, updated_at = ?4 WHERE id = ?5",
         params![title, file_hash, file_size, now, id],
     )?;
     // 同步 FTS：title 和 content
-    conn.execute(
+    tx.execute(
         "UPDATE objects_fts SET content = ?1, title = ?2 WHERE id = ?3",
         params![content, title, id],
     )?;
-    let after = get_object(conn, id)?.and_then(|obj| serde_json::to_string(&obj).ok());
-    log_operation(
-        conn,
+    tx.execute(
+        "UPDATE objects_fts_cjk SET content = ?1, title = ?2 WHERE id = ?3",
+        params![content, title, id],
+    )?;
+    let after = get_object(&tx, id)?.and_then(|obj| serde_json::to_string(&obj).ok());
+    log_operation_with_files(
+        &tx,
         "update_content",
         Some(id),
         before.as_deref(),
         after.as_deref(),
+        Some(&serde_json::json!({ "content": before_content }).to_string()),
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -445,6 +553,27 @@ pub fn update_object_creator(conn: &Connection, id: &str, created_by: &str) -> R
     log_operation(
         conn,
         "update_creator",
+        Some(id),
+        before.as_deref(),
+        after.as_deref(),
+    )?;
+    Ok(())
+}
+
+pub fn update_object_metadata(conn: &Connection, id: &str, metadata: &str) -> Result<()> {
+    let before = get_object(conn, id)?.and_then(|obj| serde_json::to_string(&obj).ok());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    conn.execute(
+        "UPDATE objects SET metadata = ?1, updated_at = ?2 WHERE id = ?3",
+        params![metadata, now, id],
+    )?;
+    let after = get_object(conn, id)?.and_then(|obj| serde_json::to_string(&obj).ok());
+    log_operation(
+        conn,
+        "update_metadata",
         Some(id),
         before.as_deref(),
         after.as_deref(),
@@ -538,6 +667,15 @@ pub fn search_objects(conn: &Connection, query: &str, limit: i64) -> Result<Vec<
         return Ok(Vec::new());
     }
     let fts_query = format!("\"{}\"", normalized.replace('"', "\"\""));
+    let has_cjk = normalized.chars().any(is_cjk_character);
+    let mut out = if has_cjk && normalized.chars().count() >= 3 {
+        search_cjk_trigram(conn, normalized, limit)?
+    } else {
+        Vec::new()
+    };
+    if !out.is_empty() {
+        return Ok(out);
+    }
     let mut stmt = conn.prepare(
         "SELECT f.id, f.title, o.type, o.format, bm25(objects_fts) AS score, snippet(objects_fts, 2, '<mark>', '</mark>', '...', 16) AS snippet, o.created_by
          FROM objects_fts f
@@ -557,7 +695,7 @@ pub fn search_objects(conn: &Connection, query: &str, limit: i64) -> Result<Vec<
             created_by: row.get(6)?,
         })
     })?;
-    let mut out = Vec::new();
+    out.clear();
     for r in rows {
         out.push(r?);
     }
@@ -592,6 +730,43 @@ pub fn search_objects(conn: &Connection, query: &str, limit: i64) -> Result<Vec<
     Ok(out)
 }
 
+fn is_cjk_character(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0x3040..=0x30FF
+            | 0xAC00..=0xD7AF
+    )
+}
+
+fn search_cjk_trigram(conn: &Connection, query: &str, limit: i64) -> Result<Vec<ObjectSummary>> {
+    let fts_query = format!("\"{}\"", query.replace('"', "\"\""));
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.title, o.type, o.format, bm25(objects_fts_cjk) AS score,
+                snippet(objects_fts_cjk, 2, '<mark>', '</mark>', '...', 24), o.created_by
+         FROM objects_fts_cjk c
+         JOIN objects o ON o.id = c.id
+         WHERE objects_fts_cjk MATCH ?1 AND o.status != 'deleted'
+         ORDER BY score
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![fts_query, limit.max(1)], |row| {
+        Ok(ObjectSummary {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            r#type: row.get(2)?,
+            format: row.get(3)?,
+            score: row.get(4)?,
+            snippet: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            created_by: row.get(6)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 fn escape_like(input: &str) -> String {
     let mut out = String::new();
     for ch in input.chars() {
@@ -615,6 +790,63 @@ pub fn add_tags(conn: &Connection, object_id: &str, tags: &[String]) -> Result<(
             params![object_id, tag],
         )?;
     }
+    let joined = get_tags(conn, object_id)?.join(" ");
+    conn.execute(
+        "UPDATE objects_fts SET tags = ?1 WHERE id = ?2",
+        params![joined, object_id],
+    )?;
+    conn.execute(
+        "UPDATE objects_fts_cjk SET tags = ?1 WHERE id = ?2",
+        params![joined, object_id],
+    )?;
+    Ok(())
+}
+
+pub fn replace_tags(conn: &Connection, object_id: &str, tags: &[String]) -> Result<()> {
+    conn.execute("DELETE FROM tags WHERE object_id = ?1", params![object_id])?;
+    add_tags(conn, object_id, tags)
+}
+
+pub fn get_object_embedding(
+    conn: &Connection,
+    object_id: &str,
+    model: &str,
+    content_hash: &str,
+) -> Result<Option<Vec<f32>>> {
+    let value = conn
+        .query_row(
+            "SELECT vector FROM object_embeddings
+             WHERE object_id = ?1 AND model = ?2 AND content_hash = ?3",
+            params![object_id, model, content_hash],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    value
+        .map(|encoded| {
+            serde_json::from_str(&encoded)
+                .map_err(|error| crate::error::KbError::ParseFailed(error.to_string()))
+        })
+        .transpose()
+}
+
+pub fn upsert_object_embedding(
+    conn: &Connection,
+    object_id: &str,
+    model: &str,
+    content_hash: &str,
+    vector: &[f32],
+) -> Result<()> {
+    let encoded = serde_json::to_string(vector)
+        .map_err(|error| crate::error::KbError::ParseFailed(error.to_string()))?;
+    conn.execute(
+        "INSERT INTO object_embeddings (object_id, model, content_hash, vector, updated_at)
+         VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s', 'now') AS INTEGER))
+         ON CONFLICT(object_id, model) DO UPDATE SET
+           content_hash = excluded.content_hash,
+           vector = excluded.vector,
+           updated_at = excluded.updated_at",
+        params![object_id, model, content_hash, encoded],
+    )?;
     Ok(())
 }
 
@@ -646,13 +878,58 @@ pub fn get_all_tags_map(conn: &Connection) -> Result<HashMap<String, Vec<String>
 // ===== 关系 =====
 
 pub fn link_objects(conn: &Connection, from: &str, to: &str, relation: &str) -> Result<()> {
+    link_objects_with_source(conn, from, to, relation, "automatic")
+}
+
+pub fn link_objects_manual(conn: &Connection, from: &str, to: &str, relation: &str) -> Result<()> {
+    link_objects_with_source(conn, from, to, relation, "manual")?;
+    log_operation(
+        conn,
+        "link_objects",
+        Some(from),
+        Some(&serde_json::json!({"target_id": to, "relation_type": relation}).to_string()),
+        None,
+    )?;
+    Ok(())
+}
+
+pub fn unlink_manual_relation(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    relation: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM relations WHERE source_id = ?1 AND target_id = ?2 AND relation_type = ?3 AND source = 'manual'",
+        params![from, to, relation],
+    )?;
+    log_operation(
+        conn,
+        "unlink_objects",
+        Some(from),
+        Some(&serde_json::json!({"target_id": to, "relation_type": relation}).to_string()),
+        None,
+    )?;
+    Ok(())
+}
+
+fn link_objects_with_source(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    relation: &str,
+    source: &str,
+) -> Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     conn.execute(
-        "INSERT OR IGNORE INTO relations (source_id, target_id, relation_type, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![from, to, relation, now],
+        "INSERT INTO relations (source_id, target_id, relation_type, source, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(source_id, target_id, relation_type) DO UPDATE SET
+           source = CASE WHEN excluded.source = 'manual' THEN 'manual' ELSE relations.source END",
+        params![from, to, relation, source, now],
     )?;
     Ok(())
 }
@@ -1040,6 +1317,52 @@ pub fn collection_path(conn: &Connection, collection_id: &str) -> Result<String>
     Ok(names.join("/"))
 }
 
+pub fn rename_collection(conn: &Connection, collection_id: &str, new_name: &str) -> Result<()> {
+    let name = new_name.trim();
+    if name.is_empty() {
+        return Err(crate::error::KbError::ParseFailed(
+            "目录名称不能为空".to_string(),
+        ));
+    }
+    let parent_id: Option<String> = conn
+        .query_row(
+            "SELECT parent_id FROM collections WHERE id = ?1 AND archived_at IS NULL",
+            params![collection_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| crate::error::KbError::NotFound(collection_id.to_string()))?;
+    let duplicate: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM collections WHERE name = ?1 AND ((parent_id = ?2) OR (parent_id IS NULL AND ?2 IS NULL)) AND id != ?3)",
+        params![name, parent_id, collection_id],
+        |row| row.get(0),
+    )?;
+    if duplicate {
+        return Err(crate::error::KbError::AlreadyExists(name.to_string()));
+    }
+    conn.execute(
+        "UPDATE collections SET name = ?1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) WHERE id = ?2",
+        params![name, collection_id],
+    )?;
+    Ok(())
+}
+
+pub fn delete_collection(conn: &Connection, collection_id: &str) -> Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?1)",
+        params![collection_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(crate::error::KbError::NotFound(collection_id.to_string()));
+    }
+    conn.execute(
+        "DELETE FROM collections WHERE id = ?1",
+        params![collection_id],
+    )?;
+    Ok(())
+}
+
 pub fn assign_object_to_collection(
     conn: &Connection,
     object_id: &str,
@@ -1165,6 +1488,23 @@ pub fn recover_running_ai_tasks(conn: &Connection) -> Result<usize> {
     .map_err(Into::into)
 }
 
+/// 删除单条已结束的 AI 任务（其动作记录由外键级联删除）。
+/// 正在运行的任务不允许删除，返回 Ok(false)。
+pub fn delete_ai_task(conn: &Connection, task_id: &str) -> Result<bool> {
+    let affected = conn.execute(
+        "DELETE FROM ai_tasks WHERE id = ?1 AND status != 'running'",
+        params![task_id],
+    )?;
+    Ok(affected > 0)
+}
+
+/// 清空所有已结束的 AI 任务（保留正在运行的）。返回删除条数。
+pub fn clear_finished_ai_tasks(conn: &Connection) -> Result<usize> {
+    conn.execute("DELETE FROM ai_tasks WHERE status != 'running'", [])
+        .map(|n| n as usize)
+        .map_err(Into::into)
+}
+
 pub fn prune_empty_collections(conn: &Connection) -> Result<usize> {
     let mut total = 0;
     loop {
@@ -1197,16 +1537,114 @@ pub fn log_operation(
     before_state: Option<&str>,
     after_state: Option<&str>,
 ) -> Result<i64> {
+    log_operation_with_files(conn, operation, object_id, before_state, after_state, None)
+}
+
+pub fn log_operation_with_files(
+    conn: &Connection,
+    operation: &str,
+    object_id: Option<&str>,
+    before_state: Option<&str>,
+    after_state: Option<&str>,
+    file_changes: Option<&str>,
+) -> Result<i64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     conn.execute(
-        "INSERT INTO operation_log (timestamp, operation, object_id, before_state, after_state, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'success')",
-        params![now, operation, object_id, before_state, after_state],
+        "INSERT INTO operation_log
+            (timestamp, operation, object_id, before_state, after_state, file_changes, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'success')",
+        params![
+            now,
+            operation,
+            object_id,
+            before_state,
+            after_state,
+            file_changes
+        ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+pub type ReversibleOperation = (i64, String, Option<String>, Option<String>, Option<String>);
+
+pub fn get_last_reversible_operation(conn: &Connection) -> Result<Option<ReversibleOperation>> {
+    let operations = [
+        "create_object",
+        "update_content",
+        "update_group",
+        "rename_object",
+        "update_creator",
+        "update_metadata",
+        "delete_object",
+        "restore_object",
+        "add_tags",
+        "link_objects",
+    ];
+    let placeholders = std::iter::repeat_n("?", operations.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, operation, object_id, before_state, file_changes
+         FROM operation_log
+         WHERE status = 'success' AND operation IN ({placeholders})
+           AND (operation != 'update_content' OR file_changes IS NOT NULL)
+         ORDER BY id DESC LIMIT 1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params = rusqlite::params_from_iter(operations);
+    let mut rows = stmt.query(params)?;
+    if let Some(row) = rows.next()? {
+        Ok(Some((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn max_operation_id(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(id), 0) FROM operation_log",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+pub fn mark_operation_rolled_back(
+    conn: &Connection,
+    operation_id: i64,
+    generated_from: i64,
+    generated_after: i64,
+    description: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE operation_log SET status = 'rolled_back' WHERE id = ?1",
+        params![operation_id],
+    )?;
+    conn.execute(
+        "UPDATE operation_log SET status = 'rollback', rollback_id = ?1
+         WHERE id > ?2 AND id <= ?3 AND status = 'success'",
+        params![operation_id, generated_from, generated_after],
+    )?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    conn.execute(
+        "INSERT INTO operation_log
+            (timestamp, operation, after_state, status, rollback_id)
+         VALUES (?1, 'undo', ?2, 'success', ?3)",
+        params![now, description, operation_id],
+    )?;
+    Ok(())
 }
 
 /// 获取最近的操作日志
@@ -1232,6 +1670,61 @@ pub fn get_recent_operations(conn: &Connection, limit: i64) -> Result<Vec<serde_
         out.push(r?);
     }
     Ok(out)
+}
+
+pub fn get_object_versions(
+    conn: &Connection,
+    object_id: &str,
+    limit: i64,
+) -> Result<Vec<crate::model::ObjectVersion>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, timestamp, before_state, file_changes
+         FROM operation_log
+         WHERE object_id = ?1 AND operation = 'update_content'
+           AND file_changes IS NOT NULL AND status IN ('success', 'rolled_back')
+         ORDER BY id DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![object_id, limit.clamp(1, 100)], |row| {
+        let before_state = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+        let file_changes = row.get::<_, Option<String>>(3)?.unwrap_or_default();
+        let title = serde_json::from_str::<serde_json::Value>(&before_state)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("title")
+                    .and_then(|item| item.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let content = serde_json::from_str::<serde_json::Value>(&file_changes)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("content")
+                    .and_then(|item| item.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        Ok(crate::model::ObjectVersion {
+            operation_id: row.get(0)?,
+            timestamp: row.get(1)?,
+            title,
+            content,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+pub fn get_object_version(
+    conn: &Connection,
+    object_id: &str,
+    operation_id: i64,
+) -> Result<crate::model::ObjectVersion> {
+    get_object_versions(conn, object_id, 100)?
+        .into_iter()
+        .find(|version| version.operation_id == operation_id)
+        .ok_or_else(|| crate::error::KbError::NotFound(operation_id.to_string()))
 }
 
 /// 清理过期操作日志（默认保留 30 天成功记录，90 天失败记录）
@@ -1342,10 +1835,15 @@ pub fn backup_database(db_path: &Path, vault_path: &Path) -> Result<PathBuf> {
     let backup_path = backup_dir.join(&backup_name);
 
     // 使用 SQLite 的 backup API 进行在线备份
-    let source = Connection::open(db_path)?;
-    let mut dest = Connection::open(&backup_path)?;
-    let backup = rusqlite::backup::Backup::new(&source, &mut dest)?;
-    backup.run_to_completion(5, std::time::Duration::from_millis(250), None)?;
+    let temp_path = backup_path.with_extension("db.tmp");
+    {
+        let source = Connection::open(db_path)?;
+        let mut dest = Connection::open(&temp_path)?;
+        let backup = rusqlite::backup::Backup::new(&source, &mut dest)?;
+        backup.run_to_completion(256, std::time::Duration::from_millis(10), None)?;
+    }
+    // 仅完整备份使用 .db 后缀，避免中断后的半成品被视为当天已备份。
+    std::fs::rename(&temp_path, &backup_path)?;
 
     // 清理旧备份，保留最近 7 个
     let mut backups: Vec<_> = Vec::new();
@@ -1368,4 +1866,255 @@ pub fn backup_database(db_path: &Path, vault_path: &Path) -> Result<PathBuf> {
     }
 
     Ok(backup_path)
+}
+
+// ===== 影子笔记（概念笔记）生成队列 =====
+
+/// 入队一个概念笔记生成任务。
+/// 如果该对象已有 pending/running 状态的任务，则跳过（唯一索引保证）。
+pub fn enqueue_concept_note(
+    conn: &Connection,
+    object_id: &str,
+    content_hash: &str,
+) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    conn.execute(
+        "INSERT OR IGNORE INTO concept_note_queue (object_id, content_hash, status, enqueued_at)
+         VALUES (?1, ?2, 'pending', ?3)",
+        params![object_id, content_hash, now],
+    )?;
+    Ok(())
+}
+
+/// 取下一个 pending 任务，标记为 running。
+/// 返回完整的任务信息（含对象标题和格式）。
+pub fn claim_next_concept_note(conn: &Connection) -> Result<Option<ConceptNoteTask>> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // 原子地取一个 pending 并标记为 running
+    let tx = conn.unchecked_transaction()?;
+    let task = tx
+        .query_row(
+            "SELECT q.id, q.object_id, q.content_hash, q.retry_count,
+                    q.error_message, q.enqueued_at,
+                    o.title, o.format
+             FROM concept_note_queue q
+             JOIN objects o ON o.id = q.object_id
+             WHERE q.status = 'pending'
+             ORDER BY q.enqueued_at ASC
+             LIMIT 1",
+            [],
+            |row| {
+                Ok(ConceptNoteTask {
+                    id: row.get(0)?,
+                    object_id: row.get(1)?,
+                    content_hash: row.get(2)?,
+                    status: "running".to_string(),
+                    retry_count: row.get(3)?,
+                    error_message: row.get(4)?,
+                    enqueued_at: row.get(5)?,
+                    finished_at: None,
+                    object_title: row.get(6)?,
+                    object_format: row.get(7)?,
+                })
+            },
+        )
+        .optional()?;
+    if let Some(mut task) = task {
+        tx.execute(
+            "UPDATE concept_note_queue SET status = 'running' WHERE id = ?1",
+            params![task.id],
+        )?;
+        tx.commit()?;
+        task.finished_at = Some(now);
+        Ok(Some(task))
+    } else {
+        // 显式回滚以释放事务（虽然没有任何修改，但保持一致性）
+        let _ = tx.rollback();
+        Ok(None)
+    }
+}
+
+/// 标记任务完成。
+pub fn finish_concept_note(conn: &Connection, task_id: i64) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    conn.execute(
+        "UPDATE concept_note_queue SET status = 'done', finished_at = ?1 WHERE id = ?2",
+        params![now, task_id],
+    )?;
+    Ok(())
+}
+
+/// 标记任务失败，递增重试计数。
+/// retry_count 达到上限（3）时标记为 failed，否则回退为 pending。
+pub fn fail_concept_note(
+    conn: &Connection,
+    task_id: i64,
+    error: &str,
+    max_retries: i64,
+) -> Result<bool> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let retry_count: i64 = conn.query_row(
+        "SELECT retry_count FROM concept_note_queue WHERE id = ?1",
+        params![task_id],
+        |row| row.get(0),
+    )?;
+    let new_retry = retry_count + 1;
+    if new_retry >= max_retries {
+        conn.execute(
+            "UPDATE concept_note_queue
+             SET status = 'failed', error_message = ?1, finished_at = ?2
+             WHERE id = ?3",
+            params![error, now, task_id],
+        )?;
+        Ok(true) // 最终失败
+    } else {
+        conn.execute(
+            "UPDATE concept_note_queue
+             SET status = 'pending', retry_count = ?1, error_message = ?2
+             WHERE id = ?3",
+            params![new_retry, error, task_id],
+        )?;
+        Ok(false) // 仍可重试
+    }
+}
+
+/// 重置 failed 任务为 pending（用户手动重试）。
+pub fn retry_concept_notes(conn: &Connection, task_ids: &[i64]) -> Result<usize> {
+    let json_ids = serde_json::to_string(task_ids)
+        .map_err(|e| KbError::ParseFailed(e.to_string()))?;
+    let count = conn.execute(
+        "UPDATE concept_note_queue
+         SET status = 'pending', retry_count = 0, error_message = NULL
+         WHERE id IN (SELECT value FROM json_each(?1)) AND status = 'failed'",
+        params![json_ids],
+    )?;
+    Ok(count)
+}
+
+/// 暂停所有 running 任务（回退为 pending）。
+pub fn pause_running_concept_notes(conn: &Connection) -> Result<usize> {
+    let count = conn.execute(
+        "UPDATE concept_note_queue SET status = 'pending' WHERE status = 'running'",
+        [],
+    )?;
+    Ok(count)
+}
+
+/// 查询队列状态（按状态过滤）。
+pub fn list_concept_notes(
+    conn: &Connection,
+    status_filter: Option<&str>,
+    limit: i64,
+) -> Result<Vec<ConceptNoteTask>> {
+    let (sql, params_values): (&str, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(status) =
+        status_filter
+    {
+        (
+            "SELECT q.id, q.object_id, q.content_hash, q.status, q.retry_count,
+                    q.error_message, q.enqueued_at, q.finished_at,
+                    o.title, o.format
+             FROM concept_note_queue q
+             JOIN objects o ON o.id = q.object_id
+             WHERE q.status = ?1
+             ORDER BY q.enqueued_at DESC
+             LIMIT ?2",
+            vec![Box::new(status.to_string()), Box::new(limit)],
+        )
+    } else {
+        (
+            "SELECT q.id, q.object_id, q.content_hash, q.status, q.retry_count,
+                    q.error_message, q.enqueued_at, q.finished_at,
+                    o.title, o.format
+             FROM concept_note_queue q
+             JOIN objects o ON o.id = q.object_id
+             ORDER BY q.enqueued_at DESC
+             LIMIT ?1",
+            vec![Box::new(limit)],
+        )
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params_values.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+        Ok(ConceptNoteTask {
+            id: row.get(0)?,
+            object_id: row.get(1)?,
+            content_hash: row.get(2)?,
+            status: row.get(3)?,
+            retry_count: row.get(4)?,
+            error_message: row.get(5)?,
+            enqueued_at: row.get(6)?,
+            finished_at: row.get(7)?,
+            object_title: row.get(8)?,
+            object_format: row.get(9)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// 统计各状态数量。
+pub fn count_concept_notes(conn: &Connection) -> Result<(i64, i64, i64, i64)> {
+    let get_count = |status: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM concept_note_queue WHERE status = ?1",
+            params![status],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+    };
+    Ok((
+        get_count("pending"),
+        get_count("running"),
+        get_count("done"),
+        get_count("failed"),
+    ))
+}
+
+/// 清理已完成的任务（保留最近 N 条）。
+pub fn cleanup_done_concept_notes(conn: &Connection, keep: i64) -> Result<usize> {
+    let count = conn.execute(
+        "DELETE FROM concept_note_queue
+         WHERE status = 'done' AND id NOT IN (
+             SELECT id FROM concept_note_queue WHERE status = 'done'
+             ORDER BY finished_at DESC LIMIT ?1
+         )",
+        params![keep],
+    )?;
+    Ok(count)
+}
+
+/// 恢复 running 状态的任务为 pending（应用启动时调用）。
+pub fn recover_concept_notes(conn: &Connection) -> Result<usize> {
+    let count = conn.execute(
+        "UPDATE concept_note_queue SET status = 'pending' WHERE status = 'running'",
+        [],
+    )?;
+    Ok(count)
+}
+
+/// 检查对象是否已有完成的概念笔记（通过 content_hash 判断是否需要重新生成）。
+pub fn get_concept_note_for_object(
+    conn: &Connection,
+    object_id: &str,
+) -> Result<Option<(i64, String, String)>> {
+    conn.query_row(
+        "SELECT id, content_hash, status FROM concept_note_queue
+         WHERE object_id = ?1 AND status = 'done'
+         ORDER BY finished_at DESC LIMIT 1",
+        params![object_id],
+        |row| Ok((row.get(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+    )
+    .optional()
+    .map_err(Into::into)
 }

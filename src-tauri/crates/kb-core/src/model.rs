@@ -30,6 +30,20 @@ pub struct ObjectSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectVersion {
+    pub operation_id: i64,
+    pub timestamp: i64,
+    pub title: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SyncReport {
+    pub changed_object_ids: Vec<String>,
+    pub rebuilt: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Relation {
     pub target_id: String,
     pub target_title: String,
@@ -82,4 +96,18 @@ pub struct AiTaskAction {
     pub collection_id: Option<String>,
     pub description: String,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptNoteTask {
+    pub id: i64,
+    pub object_id: String,
+    pub object_title: String,
+    pub object_format: String,
+    pub content_hash: String,
+    pub status: String,
+    pub retry_count: i64,
+    pub error_message: Option<String>,
+    pub enqueued_at: i64,
+    pub finished_at: Option<i64>,
 }

@@ -45,6 +45,8 @@ export interface ObjectMetadata {
   fileSize: number;
   fileHash: string;
   source?: string;
+  /** 后端 metadata JSON 中的 format 明细（如 docx / xlsx），用于展示文件类型 */
+  formatDetail?: string;
 }
 
 export interface Relation {

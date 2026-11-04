@@ -108,6 +108,8 @@ export function GraphView({ groups, relationVersion, onSelectObject }: GraphView
   const [relations, setRelations] = useState<FullRelationData[]>([]);
   const [loading, setLoading] = useState(true);
   const [scale, setScale] = useState(1);
+  const [translate, setTranslate] = useState({ x: 0, y: 0 });
+  const [panning, setPanning] = useState(false);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -130,6 +132,23 @@ export function GraphView({ groups, relationVersion, onSelectObject }: GraphView
   // 节点位置（与 simulate 配合）
   const [nodes, setNodes] = useState<GraphNode[]>([]);
   const dragOffsetRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  // 画布平移起点信息
+  const panStartRef = useRef<{ mouseX: number; mouseY: number; x: number; y: number }>({
+    mouseX: 0,
+    mouseY: 0,
+    x: 0,
+    y: 0,
+  });
+  const panMovedRef = useRef(false);
+  // 平移与缩放使用 ref，避免节点拖拽闭包读到旧值
+  const translateRef = useRef(translate);
+  const scaleRef = useRef(scale);
+  useEffect(() => {
+    translateRef.current = translate;
+  }, [translate]);
+  useEffect(() => {
+    scaleRef.current = scale;
+  }, [scale]);
 
   // 测量容器尺寸
   useEffect(() => {
@@ -235,9 +254,9 @@ export function GraphView({ groups, relationVersion, onSelectObject }: GraphView
     setDraggingId(node.id);
     const rect = containerRef.current?.getBoundingClientRect();
     if (rect) {
-      // 计算节点在屏幕坐标上的位置（考虑缩放）
-      const screenX = rect.left + node.x * scale;
-      const screenY = rect.top + node.y * scale;
+      // 计算节点在屏幕坐标上的位置（考虑缩放与平移）
+      const screenX = rect.left + node.x * scaleRef.current + translateRef.current.x;
+      const screenY = rect.top + node.y * scaleRef.current + translateRef.current.y;
       dragOffsetRef.current = { x: e.clientX - screenX, y: e.clientY - screenY };
     }
   };
@@ -247,8 +266,10 @@ export function GraphView({ groups, relationVersion, onSelectObject }: GraphView
     const onMove = (e: MouseEvent) => {
       const rect = containerRef.current?.getBoundingClientRect();
       if (!rect) return;
-      const x = (e.clientX - rect.left - dragOffsetRef.current.x) / scale;
-      const y = (e.clientY - rect.top - dragOffsetRef.current.y) / scale;
+      const s = scaleRef.current;
+      const t = translateRef.current;
+      const x = (e.clientX - rect.left - t.x - dragOffsetRef.current.x) / s;
+      const y = (e.clientY - rect.top - t.y - dragOffsetRef.current.y) / s;
       setNodes((prev) =>
         prev.map((n) =>
           n.id === draggingId
@@ -272,13 +293,54 @@ export function GraphView({ groups, relationVersion, onSelectObject }: GraphView
       window.removeEventListener("mouseup", onUp);
       document.body.style.cursor = "";
     };
-  }, [draggingId, scale, size.width, size.height]);
+  }, [draggingId, size.width, size.height]);
 
-  // 滚轮缩放
+  // 画布背景拖拽平移
+  const handleCanvasMouseDown = (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    panMovedRef.current = false;
+    panStartRef.current = {
+      mouseX: e.clientX,
+      mouseY: e.clientY,
+      x: translateRef.current.x,
+      y: translateRef.current.y,
+    };
+    setPanning(true);
+  };
+
+  useEffect(() => {
+    if (!panning) return;
+    const onMove = (e: MouseEvent) => {
+      const dx = e.clientX - panStartRef.current.mouseX;
+      const dy = e.clientY - panStartRef.current.mouseY;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) panMovedRef.current = true;
+      setTranslate({ x: panStartRef.current.x + dx, y: panStartRef.current.y + dy });
+    };
+    const onUp = () => setPanning(false);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [panning]);
+
+  // 以鼠标位置为锚点缩放
   const handleWheel = (e: React.WheelEvent) => {
-    e.preventDefault();
-    const delta = e.deltaY > 0 ? -0.1 : 0.1;
-    setScale((s) => Math.max(0.3, Math.min(3, s + delta)));
+    const rect = containerRef.current?.getBoundingClientRect();
+    const factor = e.deltaY > 0 ? 0.9 : 1.1;
+    const newScale = Math.max(0.3, Math.min(3, scaleRef.current * factor));
+    if (rect) {
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const t = translateRef.current;
+      // 保持鼠标下的内容点在缩放前后位置不变
+      setTranslate({
+        x: mx - ((mx - t.x) / scaleRef.current) * newScale,
+        y: my - ((my - t.y) / scaleRef.current) * newScale,
+      });
+    }
+    setScale(newScale);
   };
 
   // 点击节点
@@ -325,19 +387,23 @@ export function GraphView({ groups, relationVersion, onSelectObject }: GraphView
       ref={containerRef}
       className="graph-view"
       onWheel={handleWheel}
+      onMouseDown={handleCanvasMouseDown}
       style={{
         flex: 1,
         position: "relative",
         overflow: "hidden",
         background: "var(--bg-primary)",
-        cursor: draggingId ? "grabbing" : "default",
+        cursor: draggingId ? "grabbing" : panning ? "grabbing" : "grab",
       }}
     >
       <svg
         width="100%"
         height="100%"
         viewBox={`0 0 ${size.width} ${size.height}`}
-        style={{ transform: `scale(${scale})`, transformOrigin: "center center" }}
+        style={{
+          transform: `translate(${translate.x}px, ${translate.y}px) scale(${scale})`,
+          transformOrigin: "0 0",
+        }}
       >
         {/* 边 */}
         {filteredEdges.map((edge, idx) => {
@@ -405,7 +471,7 @@ export function GraphView({ groups, relationVersion, onSelectObject }: GraphView
       </svg>
 
       {/* 过滤器面板 */}
-      {showFilter && <div className="graph-filter">
+      {showFilter && <div className="graph-filter" onMouseDown={(e) => e.stopPropagation()}>
         <div className="graph-filter-section">
           <div className="graph-filter-title">对象类型</div>
           {OBJECT_TYPES.map((t) => (
@@ -454,6 +520,7 @@ export function GraphView({ groups, relationVersion, onSelectObject }: GraphView
         <>
           <div
             className="context-menu-backdrop"
+            onMouseDown={(e) => e.stopPropagation()}
             onClick={() => setContextMenu(null)}
           />
           <div
@@ -506,6 +573,7 @@ export function GraphView({ groups, relationVersion, onSelectObject }: GraphView
       {relationModal && (
         <div
           className="modal-overlay"
+          onMouseDown={(e) => e.stopPropagation()}
           onClick={(e) => {
             if (e.target === e.currentTarget) setRelationModal(null);
           }}

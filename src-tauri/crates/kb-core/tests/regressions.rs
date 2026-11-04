@@ -1,5 +1,26 @@
-use kb_core::KnowledgeBase;
+use kb_core::{db, KnowledgeBase};
 use std::io::Write;
+
+#[test]
+fn startup_maintenance_creates_one_complete_backup_per_day() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let kb = KnowledgeBase::new(&tmp.path().join("vault"));
+    kb.init_storage().expect("storage ready");
+    assert!(!kb.vault_path.join(".kb/backups").exists());
+    let note = kb.create_note("备份验证", "concept", "测试").expect("note");
+    let backup = kb
+        .backup_database()
+        .expect("backup")
+        .expect("first daily backup");
+    let conn = db::open(&backup).expect("open backup");
+    assert!(db::get_object(&conn, &note.id).unwrap().is_some());
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    assert!(kb.backup_database().expect("second backup").is_none());
+    assert!(!backup.with_extension("db.tmp").exists());
+}
 
 #[test]
 fn search_treats_user_input_as_plain_text() {
@@ -34,6 +55,199 @@ fn search_falls_back_to_chinese_substring_matching() {
     let results = kb.search("技术文档", 10).expect("search");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, obj.id);
+    let conn = kb.conn().expect("conn");
+    let indexed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM objects_fts_cjk WHERE objects_fts_cjk MATCH ?1",
+            ["\"技术文档\""],
+            |row| row.get(0),
+        )
+        .expect("trigram query");
+    assert_eq!(indexed, 1, "中文查询应命中 trigram 索引");
+}
+
+#[test]
+fn undo_restores_content_tags_and_metadata() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let kb = KnowledgeBase::new(&tmp.path().join("vault"));
+    kb.init().expect("init");
+    let obj = kb
+        .create_note("撤销测试", "concept", "测试")
+        .expect("create");
+
+    kb.save_object_content(&obj.id, "撤销测试", "第一版正文")
+        .expect("first save");
+    kb.save_object_content(&obj.id, "撤销测试", "第二版正文")
+        .expect("second save");
+    kb.undo_last_operation().expect("undo content");
+    assert_eq!(
+        kb.read_object_content(&obj.id).expect("content"),
+        "第一版正文"
+    );
+
+    kb.add_object_tags(&obj.id, &["重要".to_string(), "KBOX".to_string()])
+        .expect("tags");
+    kb.undo_last_operation().expect("undo tags");
+    let conn = kb.conn().expect("conn");
+    assert!(db::get_tags(&conn, &obj.id).expect("get tags").is_empty());
+    drop(conn);
+
+    kb.update_object_metadata(&obj.id, &serde_json::json!({ "owner": "研发" }))
+        .expect("metadata");
+    kb.undo_last_operation().expect("undo metadata");
+    let (detail, _, _) = kb.get_object_detail(&obj.id).expect("detail");
+    assert_eq!(detail.metadata, "{}");
+}
+
+#[test]
+fn content_save_rolls_back_database_and_search_when_audit_write_fails() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let kb = KnowledgeBase::new(&tmp.path().join("vault"));
+    kb.init().expect("init");
+    let object = kb
+        .create_note("事务保存", "document", "测试")
+        .expect("create");
+    kb.save_object_content(&object.id, "旧标题", "旧正文")
+        .expect("initial save");
+    let conn = kb.conn().expect("conn");
+    conn.execute_batch(
+        "CREATE TRIGGER reject_audit BEFORE INSERT ON operation_log
+         BEGIN SELECT RAISE(ABORT, 'audit blocked'); END;",
+    )
+    .expect("trigger");
+    drop(conn);
+
+    assert!(kb
+        .save_object_content(&object.id, "新标题", "新正文")
+        .is_err());
+    let (stored, _, _) = kb.get_object_detail(&object.id).expect("detail");
+    assert_eq!(stored.title, "旧标题");
+    assert_eq!(kb.read_object_content(&object.id).expect("file"), "旧正文");
+    assert!(kb.search("新正文", 10).expect("search").is_empty());
+    assert_eq!(kb.search("旧正文", 10).expect("search").len(), 1);
+}
+
+#[test]
+fn external_content_changes_sync_and_create_a_restorable_version() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let kb = KnowledgeBase::new(&tmp.path().join("vault"));
+    kb.init().expect("init");
+    let object = kb
+        .create_note("外部同步", "document", "测试")
+        .expect("create");
+    kb.save_object_content(&object.id, &object.title, "库存正文")
+        .expect("initial save");
+    let (detail, _, _) = kb.get_object_detail(&object.id).expect("detail");
+    let path = kb
+        .vault_path
+        .join("objects")
+        .join(&object.id)
+        .join(detail.primary_file.expect("primary file"));
+    std::fs::write(path, "外部编辑后的正文").expect("external write");
+
+    let report = kb.sync_external_changes().expect("sync");
+    assert_eq!(report.changed_object_ids, std::slice::from_ref(&object.id));
+    assert!(!report.rebuilt);
+    assert_eq!(
+        kb.read_object_content(&object.id).expect("content"),
+        "外部编辑后的正文"
+    );
+    assert_eq!(kb.search("外部编辑", 10).expect("search").len(), 1);
+
+    let old = kb
+        .get_object_versions(&object.id, 20)
+        .expect("versions")
+        .into_iter()
+        .find(|version| version.content == "库存正文")
+        .expect("old version");
+    kb.restore_object_version(&object.id, old.operation_id)
+        .expect("restore");
+    assert_eq!(
+        kb.read_object_content(&object.id).expect("restored"),
+        "库存正文"
+    );
+}
+
+#[test]
+fn rebuild_does_not_pollute_user_undo_history() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let kb = KnowledgeBase::new(&tmp.path().join("vault"));
+    kb.init().expect("init");
+    let object = kb
+        .create_note("重建日志", "document", "测试")
+        .expect("create");
+    kb.save_object_content(&object.id, &object.title, "正文")
+        .expect("save");
+    let before = {
+        let conn = kb.conn().expect("conn");
+        db::max_operation_id(&conn).expect("max before")
+    };
+
+    kb.rebuild().expect("rebuild");
+
+    let conn = kb.conn().expect("conn");
+    assert_eq!(db::max_operation_id(&conn).expect("max after"), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn image_ocr_updates_searchable_text_with_an_external_engine() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let image = tmp.path().join("scan.png");
+    std::fs::write(&image, b"not-a-real-image").expect("image");
+    let engine = tmp.path().join("fake-tesseract.sh");
+    std::fs::write(&engine, "#!/bin/sh\nprintf '车规以太网识别结果\\n'\n").expect("engine");
+    let mut permissions = std::fs::metadata(&engine).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&engine, permissions).expect("permissions");
+
+    let kb = KnowledgeBase::new(&tmp.path().join("vault"));
+    kb.init().expect("init");
+    let object = kb.ingest_file(&image, Some("扫描件")).expect("ingest");
+    std::env::set_var("KBOX_TESSERACT_BIN", &engine);
+    let text = kb.ocr_object(&object.id).expect("ocr");
+    std::env::remove_var("KBOX_TESSERACT_BIN");
+
+    assert_eq!(text, "车规以太网识别结果");
+    assert_eq!(kb.search("车规以太网", 10).expect("search").len(), 1);
+    assert!(kb
+        .read_object_content(&object.id)
+        .expect("content")
+        .contains("## OCR 文本"));
+}
+
+#[test]
+fn undo_move_restores_group_and_primary_collection() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let kb = KnowledgeBase::new(&tmp.path().join("vault"));
+    kb.init().expect("init");
+    let obj = kb
+        .create_note("目录撤销", "concept", "原目录")
+        .expect("create");
+    let target = kb
+        .ensure_collection_path("目标目录/子目录", "", "human")
+        .expect("target collection");
+
+    kb.move_object_to_collection(&obj.id, &target)
+        .expect("move");
+    kb.undo_last_operation().expect("undo move");
+
+    let (restored, _, _) = kb.get_object_detail(&obj.id).expect("detail");
+    assert_eq!(restored.group_name, "原目录");
+    let conn = kb.conn().expect("conn");
+    let collection_id: String = conn
+        .query_row(
+            "SELECT collection_id FROM object_collections WHERE object_id = ?1 AND is_primary = 1",
+            [&obj.id],
+            |row| row.get(0),
+        )
+        .expect("primary collection");
+    assert_eq!(
+        db::collection_path(&conn, &collection_id).expect("collection path"),
+        "原目录"
+    );
 }
 
 #[test]
@@ -70,6 +284,38 @@ fn rename_duplicate_group_and_agent_source_are_safe() {
     for object in kb.get_file_tree().expect("tree")[0].objects.iter() {
         assert_eq!(object.created_by, "agent");
     }
+}
+
+#[test]
+fn hierarchical_collection_rename_and_delete_update_descendants() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let kb = KnowledgeBase::new(&tmp.path().join("vault"));
+    kb.init().expect("init");
+    let object = kb
+        .create_note("层级对象", "concept", "收件箱")
+        .expect("create");
+    let child = kb
+        .ensure_collection_path("Parent/Child", "", "human")
+        .expect("child");
+    kb.move_object_to_collection(&object.id, &child)
+        .expect("move");
+    assert_eq!(kb.rename_group("Parent", "Renamed").expect("rename"), 1);
+    assert_eq!(
+        kb.get_object_detail(&object.id)
+            .expect("detail")
+            .0
+            .group_name,
+        "Renamed/Child"
+    );
+    assert_eq!(kb.delete_group("Renamed").expect("delete"), 1);
+    assert_eq!(
+        kb.get_object_detail(&object.id)
+            .expect("detail")
+            .0
+            .group_name,
+        ""
+    );
+    assert!(kb.get_collection_tree().expect("tree").is_empty());
 }
 
 #[test]
@@ -142,6 +388,53 @@ fn hierarchical_collections_migrate_and_move_objects() {
     assert_eq!(count_object(&tree, &object.id), 1);
     let (moved, _, _) = kb.get_object_detail(&object.id).expect("detail");
     assert_eq!(moved.group_name, "工作/KBOX/技术");
+}
+
+#[test]
+fn manual_related_relation_survives_relation_rebuild() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let kb = KnowledgeBase::new(&tmp.path().join("vault"));
+    kb.init().expect("init");
+    let first = kb
+        .create_note("手动关系甲", "concept", "测试")
+        .expect("first");
+    let second = kb
+        .create_note("手动关系乙", "concept", "测试")
+        .expect("second");
+    let conn = kb.conn().expect("conn");
+    db::link_objects_manual(&conn, &first.id, &second.id, "related_to").expect("link");
+    drop(conn);
+    assert_eq!(kb.get_object_detail(&first.id).expect("detail").2.len(), 1);
+    kb.rebuild_all_relations().expect("rebuild");
+    assert!(kb
+        .get_object_detail(&first.id)
+        .expect("detail")
+        .2
+        .iter()
+        .any(|relation| relation.target_id == second.id));
+}
+
+#[test]
+fn manual_relation_is_recorded_and_undoable() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let kb = KnowledgeBase::new(&tmp.path().join("vault"));
+    kb.init().expect("init");
+    let first = kb
+        .create_note("可撤销关系甲", "concept", "测试")
+        .expect("first");
+    let second = kb
+        .create_note("可撤销关系乙", "concept", "测试")
+        .expect("second");
+    let conn = kb.conn().expect("conn");
+    db::link_objects_manual(&conn, &first.id, &second.id, "related_to").expect("link");
+    drop(conn);
+    assert_eq!(kb.get_object_detail(&first.id).expect("detail").2.len(), 1);
+    kb.undo_last_operation().expect("undo relation");
+    assert!(kb
+        .get_object_detail(&first.id)
+        .expect("detail")
+        .2
+        .is_empty());
 }
 
 #[test]

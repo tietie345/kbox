@@ -1,4 +1,4 @@
-import { IconChevronLeft, IconFolderPlus, IconPlus, IconSearch, IconUpload } from "./Icons";
+import { IconChevronLeft, IconPlus, IconSearch, IconUpload } from "./Icons";
 import { FileTree } from "./FileTree";
 import type { ContextMenuState } from "./ContextMenu";
 import type { TreeNode } from "../mock/data";
@@ -13,10 +13,9 @@ interface SidebarProps {
   onOpenCommand: () => void;
   onNewNote: () => void;
   onImport: () => void;
-  onNewFolder: () => void;
-  onAiOrganize: () => void;
-  onNewObjectInFolder: (groupName: string) => void;
+  onNewObjectInFolder: (groupName: string, collectionId?: string) => void;
   onMoveObject?: (objectId: string, target: string, label?: string) => void;
+  shadowNoteMap?: Record<string, boolean>;
 }
 
 export function Sidebar({
@@ -29,10 +28,9 @@ export function Sidebar({
   onOpenCommand,
   onNewNote,
   onImport,
-  onNewFolder,
-  onAiOrganize,
   onNewObjectInFolder,
   onMoveObject,
+  shadowNoteMap,
 }: SidebarProps) {
   if (collapsed) {
     return (
@@ -99,14 +97,6 @@ export function Sidebar({
           <IconUpload size={13} />
           导入
         </button>
-        <button className="action-btn" onClick={onNewFolder} title="新建文件夹">
-          <IconFolderPlus size={13} />
-          文件夹
-        </button>
-        <button className="action-btn sidebar-ai-action" onClick={onAiOrganize} title="手动发起 AI 整理">
-          <span aria-hidden="true">✦</span>
-          AI 整理
-        </button>
       </div>
 
       <FileTree
@@ -116,6 +106,7 @@ export function Sidebar({
         onContextMenu={onContextMenu}
         onMoveObject={onMoveObject}
         onNewObjectInFolder={onNewObjectInFolder}
+        shadowNoteMap={shadowNoteMap}
       />
     </div>
   );

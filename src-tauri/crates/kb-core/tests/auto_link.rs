@@ -287,9 +287,9 @@ fn test_auto_link_skip_short_title() {
     println!("✅ 测试通过：短标题跳过");
 }
 
-/// 策略 3：同分组自动关联（same_group），排除默认分组
+/// 同目录对象不再自动全连接，避免 O(N²) 关系膨胀和图谱噪音。
 #[test]
-fn test_auto_link_same_group() {
+fn test_auto_link_does_not_connect_every_object_in_a_group() {
     let tmp = tempfile::tempdir().expect("tmp");
     let vault = tmp.path().join("vault");
     let kb = KnowledgeBase::new(&vault);
@@ -302,16 +302,9 @@ fn test_auto_link_same_group() {
     let obj2 = kb
         .create_note("笔记B", "concept", "技术概念")
         .expect("create obj2");
-    // 第三个在收件箱（应跳过）
-    let obj3 = kb
-        .create_note("笔记C", "concept", "收件箱")
-        .expect("create obj3");
-
-    // 触发 obj1 的 auto_link
     kb.auto_link_relations(&obj1.id).expect("auto_link");
 
     let conn = kb.conn().expect("conn");
-    // obj1 -> obj2 应有 same_group 关系
     let count_ab: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM relations WHERE source_id = ?1 AND target_id = ?2 AND relation_type = 'same_group'",
@@ -319,22 +312,10 @@ fn test_auto_link_same_group() {
             |row| row.get(0),
         )
         .unwrap_or(0);
-    assert_eq!(count_ab, 1, "同分组对象应建立 same_group 关系");
-
-    // obj1 -> obj3 在收件箱，不应建立 same_group
-    let count_ac: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM relations WHERE source_id = ?1 AND target_id = ?2 AND relation_type = 'same_group'",
-            rusqlite::params![&obj1.id, &obj3.id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    assert_eq!(count_ac, 0, "收件箱分组不应建立 same_group 关系");
-
-    println!("✅ 测试通过：同分组自动关联");
+    assert_eq!(count_ab, 0, "同目录本身不应产生自动关系");
 }
 
-/// 策略 4：共享标签关联（same_tag）
+/// 策略 3：共享标签关联（same_tag）
 #[test]
 fn test_auto_link_same_tag() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -413,4 +394,36 @@ fn test_auto_link_title_contains() {
     assert_eq!(count, 1, "标题包含应建立 title_contains 关系");
 
     println!("✅ 测试通过：标题包含关联");
+}
+
+#[test]
+fn automatic_relations_are_capped_per_object() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let vault = tmp.path().join("vault");
+    let kb = KnowledgeBase::new(&vault);
+    kb.init().expect("init");
+    let source = kb
+        .create_note("关系上限源", "concept", "测试")
+        .expect("source");
+    kb.add_object_tags(&source.id, &["公共标签".to_string()])
+        .expect("source tag");
+    for index in 0..30 {
+        let object = kb
+            .create_note(&format!("关系候选 {index}"), "concept", "测试")
+            .expect("candidate");
+        kb.add_object_tags(&object.id, &["公共标签".to_string()])
+            .expect("candidate tag");
+    }
+
+    let added = kb.auto_link_relations(&source.id).expect("auto link");
+    assert_eq!(added, 20);
+    let conn = kb.conn().expect("conn");
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM relations WHERE source_id = ?1 AND relation_type IN ('related_to', 'same_tag', 'title_contains')",
+            [&source.id],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(count, 20);
 }

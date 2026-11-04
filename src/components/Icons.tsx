@@ -45,6 +45,21 @@ export const IconUpload = ({ size = 16, className, style }: IconProps) => (
   </svg>
 );
 
+export const IconUndo = ({ size = 16, className, style }: IconProps) => (
+  <svg {...base(size)} className={className} style={style}>
+    <path d="M9 7 4 12l5 5" />
+    <path d="M4 12h9a7 7 0 0 1 7 7" />
+  </svg>
+);
+
+export const IconHistory = ({ size = 16, className, style }: IconProps) => (
+  <svg {...base(size)} className={className} style={style}>
+    <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
+    <path d="M3 3v5h5" />
+    <path d="M12 7v5l3 2" />
+  </svg>
+);
+
 export const IconRadar = ({ size = 16, className, style }: IconProps) => (
   <svg {...base(size)} className={className} style={style}>
     <circle cx="12" cy="12" r="9" />

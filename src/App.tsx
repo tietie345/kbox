@@ -1,9 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Toolbar } from "./components/Toolbar";
 import type { ViewMode } from "./components/Toolbar";
 import { Sidebar } from "./components/Sidebar";
-import { EditorView } from "./components/EditorView";
 import type { EditorTab } from "./components/EditorView";
 import { RightPanel } from "./components/RightPanel";
 import { StatusBar } from "./components/StatusBar";
@@ -13,26 +12,20 @@ import {
   type ContextMenuItem,
   type ContextMenuState,
 } from "./components/ContextMenu";
-import { NewNoteModal } from "./components/Modals/NewNoteModal";
-import type { NewNoteResult } from "./components/Modals/NewNoteModal";
+import type { NewNoteResult, NewItemLocation } from "./components/Modals/NewNoteModal";
 import type { NewItemType } from "./components/Modals/NewNoteModal";
-import { SettingsModal } from "./components/Modals/SettingsModal";
-import { RelationModal } from "./components/Modals/RelationModal";
-import { FileDiscoveryModal } from "./components/Modals/FileDiscoveryModal";
-import { AiOrganizeModal } from "./components/Modals/AiOrganizeModal";
 import {
   CommandPalette,
   makeDefaultActions,
   type CommandAction,
 } from "./components/CommandPalette";
 import { ToastProvider, useToast } from "./components/Toast";
-import { GraphView } from "./components/GraphView";
-import { TrashView } from "./components/TrashView";
-import { FilesView } from "./components/FilesView";
 import type { TreeNode, ObjectMetadata, Relation } from "./mock/data";
 import {
   autoLink,
   checkAgentConfig,
+  detectAgents,
+  type AgentStatus,
   createNote as apiCreateNote,
   createCollection as apiCreateCollection,
   deleteObject as apiDeleteObject,
@@ -43,6 +36,7 @@ import {
   getObject,
   getStats,
   importFolder as apiImportFolder,
+  importUrl as apiImportUrl,
   importFile as apiImportFile,
   importDiscoveryFiles,
   ignoreDiscoveryFiles,
@@ -58,13 +52,41 @@ import {
   scanDiscoveryFolders,
   unlinkObjects as apiUnlinkObjects,
   updateObjectGroup as apiUpdateObjectGroup,
+  undoLastOperation,
   moveObjectToCollection as apiMoveObjectToCollection,
   type CollectionNode,
   type GroupNode,
   type ObjectDetail,
   type DiscoveryCandidate,
   type AiTaskEvent,
+  type SyncReport,
+  type ConceptNoteEvent,
+  type ConceptNoteStatus,
+  startConceptNote as apiStartConceptNote,
+  startConceptNoteBatch as apiStartConceptNoteBatch,
+  getConceptNoteStatus as apiGetConceptNoteStatus,
+  setConceptNotePaused as apiSetConceptNotePaused,
+  setConceptNoteEnabled as apiSetConceptNoteEnabled,
+  retryAllConceptNotes as apiRetryAllConceptNotes,
+  retryConceptNotes as apiRetryConceptNotes,
+  checkConceptNote as apiCheckConceptNote,
 } from "./api";
+
+import { EditorEmpty } from "./components/EditorEmpty";
+
+const EditorView = lazy(() => import("./components/EditorView").then((module) => ({ default: module.EditorView })));
+const GraphView = lazy(() => import("./components/GraphView").then((module) => ({ default: module.GraphView })));
+const TrashView = lazy(() => import("./components/TrashView").then((module) => ({ default: module.TrashView })));
+const FilesView = lazy(() => import("./components/FilesView").then((module) => ({ default: module.FilesView })));
+const NewNoteModal = lazy(() => import("./components/Modals/NewNoteModal").then((module) => ({ default: module.NewNoteModal })));
+const SettingsModal = lazy(() => import("./components/Modals/SettingsModal").then((module) => ({ default: module.SettingsModal })));
+const RelationModal = lazy(() => import("./components/Modals/RelationModal").then((module) => ({ default: module.RelationModal })));
+const FileDiscoveryModal = lazy(() => import("./components/Modals/FileDiscoveryModal").then((module) => ({ default: module.FileDiscoveryModal })));
+const AiOrganizeModal = lazy(() => import("./components/Modals/AiOrganizeModal").then((module) => ({ default: module.AiOrganizeModal })));
+const VersionHistoryModal = lazy(() => import("./components/Modals/VersionHistoryModal").then((module) => ({ default: module.VersionHistoryModal })));
+const ImportUrlModal = lazy(() => import("./components/Modals/ImportUrlModal").then((module) => ({ default: module.ImportUrlModal })));
+const ImportChoiceModal = lazy(() => import("./components/Modals/ImportChoiceModal").then((module) => ({ default: module.ImportChoiceModal })));
+const AgentLinkModal = lazy(() => import("./components/Modals/AgentLinkModal").then((module) => ({ default: module.AgentLinkModal })));
 
 type Theme = "dark" | "light";
 
@@ -122,6 +144,20 @@ function collectionNodesToTree(collections: CollectionNode[]): TreeNode[] {
   }));
 }
 
+/** 递归收集所有 collection 为带路径的扁平列表 */
+function flattenCollectionLocations(
+  nodes: CollectionNode[],
+  acc: NewItemLocation[] = []
+): NewItemLocation[] {
+  for (const node of nodes) {
+    acc.push({ id: node.id, label: node.path || node.name, collectionId: node.id });
+    if (node.children.length) {
+      flattenCollectionLocations(node.children, acc);
+    }
+  }
+  return acc;
+}
+
 // 把 ObjectDetail 转为 RightPanel 使用的 ObjectMetadata
 function detailToMetadata(
   detail: ObjectDetail,
@@ -129,6 +165,14 @@ function detailToMetadata(
 ): ObjectMetadata {
   const o = detail.object;
   const iso = (n: number) => new Date(n * 1000).toISOString();
+  // 从后端 metadata JSON 中取出 format 明细（docx / xlsx 等），用于展示文件类型
+  let formatDetail: string | undefined;
+  try {
+    const m = JSON.parse(o.metadata || "{}");
+    if (typeof m?.format === "string") formatDetail = m.format;
+  } catch {
+    // metadata 不是合法 JSON时忽略
+  }
   return {
     id: o.id,
     type: o.type as any,
@@ -143,6 +187,7 @@ function detailToMetadata(
     fileSize: o.file_size,
     fileHash: o.file_hash ?? "",
     source: o.created_by === "agent" ? "Agent 自动生成" : "手动创建",
+    formatDetail,
   };
 }
 
@@ -152,6 +197,22 @@ function detailToRelations(detail: ObjectDetail): Relation[] {
     targetTitle: r.target_title,
     relationType: r.relation_type as any,
   }));
+}
+
+function aiCompletionNotice(event: AiTaskEvent): string {
+  const result = event.result;
+  if (!result) return "AI 任务已完成";
+  const changes = [
+    ["目录", result.created_directories],
+    ["移动", result.moved_objects],
+    ["归档", result.archived_objects],
+    ["清理", result.removed_directories],
+  ]
+    .filter(([, count]) => Number(count) > 0)
+    .map(([label, count]) => `${label} ${count}`);
+  return changes.length > 0
+    ? `AI 任务已完成 · ${changes.join(" · ")}`
+    : "AI 任务已完成";
 }
 
 function AppInner() {
@@ -166,7 +227,7 @@ function AppInner() {
 
   // ===== 布局状态 =====
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [rightCollapsed, setRightCollapsed] = useState(false);
+  const [rightCollapsed, setRightCollapsed] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(260);
   const [rightWidth, setRightWidth] = useState(300);
 
@@ -175,6 +236,8 @@ function AppInner() {
 
   // ===== 文件树 =====
   const [tree, setTree] = useState<TreeNode[]>([]);
+  // 保留 collection 原始树（含 id），用于新建弹窗的位置下拉
+  const [collectionNodes, setCollectionNodes] = useState<CollectionNode[]>([]);
   // 保留原始 GroupNode 数据，用于图谱视图
   const [groupNodes, setGroupNodes] = useState<GroupNode[]>([]);
   // 关系版本号：保存/删除/重建关系后递增，触发图谱重新加载
@@ -198,11 +261,18 @@ function AppInner() {
   // ===== 弹窗 =====
   const [showNewNote, setShowNewNote] = useState(false);
   const [newItemGroup, setNewItemGroup] = useState("收件箱");
-  const [newItemInitialType, setNewItemInitialType] = useState<NewItemType>("concept");
+  // 从文件夹内点「+」时预选的 collection id
+  const [newItemCollectionId, setNewItemCollectionId] = useState<string | undefined>(undefined);
+  const [newItemInitialType, setNewItemInitialType] = useState<NewItemType>("document");
+  // 新建子文件夹时的父目录 id（仅 folder 类型使用；为空则建在根）
+  const [newItemParent, setNewItemParent] = useState<{ collectionId?: string; parentName?: string }>({});
   const [showSettings, setShowSettings] = useState(false);
   const [showCommand, setShowCommand] = useState(false);
   const [showDiscovery, setShowDiscovery] = useState(false);
   const [showAiOrganize, setShowAiOrganize] = useState(false);
+  const [showImportChoice, setShowImportChoice] = useState(false);
+  const [showVersionHistory, setShowVersionHistory] = useState(false);
+  const [showImportUrl, setShowImportUrl] = useState(false);
   const [aiOrganizeTarget, setAiOrganizeTarget] = useState<{
     collectionId: string;
     collectionPath: string;
@@ -228,6 +298,8 @@ function AppInner() {
     () => localStorage.getItem("kb-ai-enhanced") === "true"
   );
   const [agentOnline, setAgentOnline] = useState(false);
+  const [showAgentLink, setShowAgentLink] = useState(false);
+  const [agentList, setAgentList] = useState<AgentStatus[]>([]);
 
   // ===== 右键菜单 =====
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
@@ -241,6 +313,12 @@ function AppInner() {
   // ===== 统计 =====
   const [objectCount, setObjectCount] = useState(0);
 
+  // ===== 影子笔记 =====
+  const [shadowNoteStatus, setShadowNoteStatus] = useState<ConceptNoteStatus | null>(null);
+  const [shadowPopoverOpen, setShadowPopoverOpen] = useState(false);
+  const [shadowNoteMap, setShadowNoteMap] = useState<Record<string, boolean>>({});
+  const [activeConceptNote, setActiveConceptNote] = useState<string | null>(null);
+
   // ===== 刷新文件树 =====
   const refreshTree = useCallback(async () => {
     try {
@@ -249,6 +327,7 @@ function AppInner() {
         getCollectionTree(),
       ]);
       setGroupNodes(groups);
+      setCollectionNodes(collections);
       const collectionTree = collectionNodesToTree(collections);
       const ungrouped = groups.find((group) => group.name === "未分组");
       if (ungrouped?.objects.length) {
@@ -276,7 +355,9 @@ function AppInner() {
       if (task.kind === "completed") {
         Promise.all([refreshTree(), refreshStats()]).then(() => {
           setRelationVersion((version) => version + 1);
-          toast("success", `AI 整理已完成：${task.description}`);
+          // AI 抽屉已显示完整回答，此时不再叠加全局通知。
+          // 仅当抽屉关闭、任务在后台完成时显示紧凑状态。
+          if (!showAiOrganize) toast("success", aiCompletionNotice(task));
         }).catch(() => undefined);
       } else if (task.kind === "failed") {
         toast("error", `AI 整理失败：${task.description}`);
@@ -288,35 +369,86 @@ function AppInner() {
       dispose = unlisten;
     });
     return () => dispose?.();
-  }, [refreshTree, refreshStats, toast]);
+  }, [refreshTree, refreshStats, showAiOrganize, toast]);
+
+  // ===== 影子笔记事件监听 =====
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    listen<ConceptNoteEvent>("concept-note-event", (event) => {
+      const evt = event.payload;
+      // 更新队列状态
+      apiGetConceptNoteStatus(50).then(setShadowNoteStatus).catch(() => undefined);
+      // 完成时刷新文件树和对象的概念笔记状态
+      if (evt.kind === "completed" && evt.object_id) {
+        refreshTree();
+        setShadowNoteMap((prev) => ({ ...prev, [evt.object_id!]: true }));
+        // 如果当前打开的对象就是这个，刷新概念笔记
+        if (evt.object_id === activeTabId) {
+          apiCheckConceptNote(evt.object_id).then((has) => {
+            if (has) loadObject(evt.object_id!);
+          }).catch(() => undefined);
+        }
+        toast("success", evt.description);
+      } else if (evt.kind === "failed") {
+        toast("error", evt.description);
+      }
+    }).then((unlisten) => {
+      dispose = unlisten;
+    });
+    return () => dispose?.();
+  }, [refreshTree, activeTabId, toast]);
+
+  // ===== 启动时加载影子笔记状态 =====
+  useEffect(() => {
+    apiGetConceptNoteStatus(50).then(setShadowNoteStatus).catch(() => undefined);
+  }, []);
 
   // ===== 初始化加载 =====
   useEffect(() => {
     refreshTree();
     refreshStats();
-    checkAgentConfig().then(setAgentOnline).catch(() => setAgentOnline(false));
+    // Agent 配置扫描需要读取多个用户目录下的文件，延后到首屏绘制后。
+    const timer = window.setTimeout(() => {
+      detectAgents()
+        .then((list) => {
+          setAgentList(list);
+          setAgentOnline(list.some((a) => a.registered));
+        })
+        .catch(() => undefined);
+    }, 300);
+    return () => window.clearTimeout(timer);
   }, [refreshTree, refreshStats]);
 
+  const discoveryScanVersion = useRef(0);
   const runDiscoveryScan = useCallback(async (folders = discoveryFolders) => {
+    const version = ++discoveryScanVersion.current;
     if (folders.length === 0) {
       setDiscoveryCandidates([]);
+      setDiscoveryScanning(false);
       return;
     }
     setDiscoveryScanning(true);
     try {
-      setDiscoveryCandidates(await scanDiscoveryFolders(folders));
+      const candidates = await scanDiscoveryFolders(folders);
+      if (version === discoveryScanVersion.current) setDiscoveryCandidates(candidates);
     } catch (error: any) {
       toast("error", `扫描新文件失败: ${error}`);
     } finally {
-      setDiscoveryScanning(false);
+      if (version === discoveryScanVersion.current) setDiscoveryScanning(false);
     }
   }, [discoveryFolders, toast]);
 
   useEffect(() => {
-    if (discoveryFolders.length === 0) return;
-    runDiscoveryScan(discoveryFolders);
+    if (discoveryFolders.length === 0) {
+      runDiscoveryScan(discoveryFolders);
+      return;
+    }
+    const initialScan = window.setTimeout(() => runDiscoveryScan(discoveryFolders), 1500);
     const timer = window.setInterval(() => runDiscoveryScan(discoveryFolders), 6 * 60 * 60 * 1000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearTimeout(initialScan);
+      window.clearInterval(timer);
+    };
   }, [discoveryFolders, runDiscoveryScan]);
 
   const addDiscoveryFolders = useCallback(async () => {
@@ -413,12 +545,65 @@ function AppInner() {
         setTitles((prev) => ({ ...prev, [id]: detail.object.title }));
         setLoadedIds((prev) => ({ ...prev, [id]: true }));
         setDirty((prev) => ({ ...prev, [id]: false }));
+
+        // 检查对象是否有概念笔记，如有则从 content 中提取
+        try {
+          const hasConcept = await apiCheckConceptNote(id);
+          if (hasConcept) {
+            setShadowNoteMap((prev) => ({ ...prev, [id]: true }));
+            // 从 content 中提取概念摘要段
+            const body = detail.content || "";
+            const marker = "## 概念摘要";
+            const start = body.indexOf(marker);
+            if (start >= 0) {
+              const afterMarker = body.slice(start + marker.length).trimStart();
+              const nextSection = afterMarker.indexOf("\n## ");
+              const conceptText = nextSection >= 0
+                ? afterMarker.slice(0, nextSection).trim()
+                : afterMarker.trim();
+              setActiveConceptNote(conceptText || null);
+            } else {
+              setActiveConceptNote(null);
+            }
+          } else {
+            setShadowNoteMap((prev) => ({ ...prev, [id]: false }));
+            setActiveConceptNote(null);
+          }
+        } catch {
+          // 概念笔记检查失败不影响对象加载
+          setActiveConceptNote(null);
+        }
       } catch (e: any) {
         toast("error", `加载对象失败: ${e}`);
       }
     },
     [toast]
   );
+
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    listen<SyncReport>("vault-changed", (event) => {
+      const report = event.payload;
+      Promise.all([refreshTree(), refreshStats()]).catch(() => undefined);
+      setRelationVersion((version) => version + 1);
+      if (
+        activeTabId &&
+        report.changed_object_ids.includes(activeTabId) &&
+        !dirty[activeTabId]
+      ) {
+        loadObject(activeTabId);
+      }
+      toast(
+        "info",
+        report.rebuilt
+          ? "检测到外部文件结构变化，知识库已同步"
+          : `已同步 ${report.changed_object_ids.length} 个外部修改`
+      );
+    }).then((unlisten) => {
+      dispose = unlisten;
+    });
+    return () => dispose?.();
+  }, [activeTabId, dirty, loadObject, refreshStats, refreshTree, toast]);
 
   // ===== 打开对象 =====
   const openObject = useCallback(
@@ -500,12 +685,6 @@ function AppInner() {
     setActiveTabId(null);
   }, []);
 
-  const handleNewFolder = useCallback(() => {
-    setNewItemGroup("收件箱");
-    setNewItemInitialType("folder");
-    setShowNewNote(true);
-  }, []);
-
   // ===== 内容/标题修改 =====
   const handleContentChange = useCallback((id: string, content: string) => {
     setContents((prev) => ({ ...prev, [id]: content }));
@@ -569,13 +748,26 @@ function AppInner() {
     async (result: NewNoteResult) => {
       try {
         if (result.type === "folder") {
-          const id = await apiCreateCollection(result.title);
+          const created = await apiCreateCollection(
+            result.title,
+            newItemParent.collectionId
+          );
           await refreshTree();
           setShowNewNote(false);
-          toast("success", `文件夹「${result.title}」已就绪（${id}）`);
+          setNewItemParent({});
+          toast("success", `文件夹「${result.title}」已就绪（${created}）`);
           return;
         }
-        const obj = await apiCreateNote(result.title, result.type, newItemGroup);
+        const targetGroup = result.targetLabel || newItemGroup;
+        const obj = await apiCreateNote(result.title, result.type, targetGroup);
+        // 若选择的是某个目录（collection），创建后移动到该目录
+        if (result.collectionId) {
+          try {
+            await apiMoveObjectToCollection(obj.id, result.collectionId);
+          } catch (moveErr) {
+            console.warn("移动到目录失败", moveErr);
+          }
+        }
         // 刷新树和统计
         await refreshTree();
         await refreshStats();
@@ -598,12 +790,42 @@ function AppInner() {
         toast("error", `创建失败: ${e}`);
       }
     },
-    [refreshTree, refreshStats, toast, loadObject, newItemGroup]
+    [refreshTree, refreshStats, toast, loadObject, newItemGroup, newItemParent]
   );
 
-  const openNewItem = useCallback((groupName = "收件箱") => {
+  const openNewItem = useCallback((groupName = "收件箱", collectionId?: string) => {
     setNewItemGroup(groupName);
-    setNewItemInitialType("concept");
+    setNewItemCollectionId(collectionId);
+    setNewItemInitialType("document");
+    setNewItemParent({});
+    setShowNewNote(true);
+  }, []);
+
+  // 新建弹窗的位置列表：收件箱 + 所有目录 + 其他分组
+  const newItemLocations = useMemo<NewItemLocation[]>(() => {
+    const selectedCollectionId = newItemCollectionId;
+    const collections = flattenCollectionLocations(collectionNodes);
+    const knownPaths = new Set(collections.map((c) => c.label));
+    const extraGroups: NewItemLocation[] = groupNodes
+      .filter((g) => g.name !== "收件箱" && !knownPaths.has(g.name))
+      .map((g) => ({ id: g.name, label: g.name }));
+    const inbox: NewItemLocation = { id: "收件箱", label: "收件箱" };
+    const locations = [inbox, ...collections, ...extraGroups];
+    // 若预选位置不在列表中（理论上不会），追加一项
+    if (newItemGroup && !locations.some((l) => l.id === newItemGroup) &&
+        !locations.some((l) => l.id === selectedCollectionId)) {
+      locations.push({ id: selectedCollectionId ?? newItemGroup, label: newItemGroup, collectionId: selectedCollectionId });
+    }
+    return locations;
+  }, [collectionNodes, groupNodes, newItemGroup, newItemCollectionId]);
+
+  // 弹窗打开时默认选中的位置 id
+  const newItemInitialLocationId = newItemCollectionId ?? newItemGroup;
+
+  const handleNewFolder = useCallback((collectionId?: string, parentName?: string) => {
+    setNewItemGroup(parentName ?? "收件箱");
+    setNewItemInitialType("folder");
+    setNewItemParent({ collectionId, parentName });
     setShowNewNote(true);
   }, []);
 
@@ -633,6 +855,8 @@ function AppInner() {
       toast("success", `已导入 ${success} 个文件${failed > 0 ? `（${failed} 个失败）` : ""}`);
       await refreshTree();
       await refreshStats();
+      // 刷新影子笔记队列状态
+      apiGetConceptNoteStatus(50).then(setShadowNoteStatus).catch(() => undefined);
     }
   }, [toast, refreshTree, refreshStats]);
 
@@ -675,6 +899,35 @@ function AppInner() {
       );
     }
   }, [toast, refreshTree, refreshStats]);
+
+  const openImportChoice = useCallback(() => setShowImportChoice(true), []);
+
+  const importFiles = useCallback(async () => {
+    setShowImportChoice(false);
+    await handleImport();
+  }, [handleImport]);
+
+  const importFolder = useCallback(async () => {
+    setShowImportChoice(false);
+    await handleImportFolder();
+  }, [handleImportFolder]);
+
+  const handleUndo = useCallback(async () => {
+    try {
+      const description = await undoLastOperation();
+      await Promise.all([refreshTree(), refreshStats()]);
+      if (activeTabId) {
+        await loadObject(activeTabId).catch(() => {
+          setTabs((current) => current.filter((tab) => tab.id !== activeTabId));
+          setActiveTabId(null);
+        });
+      }
+      setRelationVersion((version) => version + 1);
+      toast("success", description);
+    } catch (error: any) {
+      toast("info", String(error));
+    }
+  }, [activeTabId, loadObject, refreshStats, refreshTree, toast]);
 
   // ===== 拖拽移动对象到分组 =====
   const handleMoveObject = useCallback(
@@ -735,7 +988,7 @@ function AppInner() {
     () =>
       makeDefaultActions({
         onNewNote: () => openNewItem(),
-        onImport: handleImport,
+        onImport: openImportChoice,
         onImportFolder: handleImportFolder,
         onOpenSettings: () => setShowSettings(true),
         onSwitchView: (v) => setView(v),
@@ -754,7 +1007,7 @@ function AppInner() {
           setTimeout(() => window.dispatchEvent(new Event("kbox:toggle-graph-filter")), 0);
         },
       }),
-    [handleImport, handleImportFolder, toast, openNewItem]
+    [openImportChoice, handleImportFolder, toast, openNewItem]
   );
 
   // ===== 右键菜单动作 =====
@@ -764,11 +1017,16 @@ function AppInner() {
       if (id === "new-note" || id === "new-object") {
         openNewItem(id === "new-object" ? (ctxMenu?.__groupName ?? "收件箱") : "收件箱");
       } else if (id === "import") {
-        handleImport();
+        openImportChoice();
       } else if (id === "import-folder") {
         handleImportFolder();
       } else if (id === "new-group") {
         await handleNewFolder();
+      } else if (id === "new-subfolder") {
+        await handleNewFolder(
+          ctxMenu?.__collectionId,
+          ctxMenu?.__collectionPath
+        );
       } else if (id === "ai-organize-collection") {
         const collectionId = ctxMenu?.__collectionId;
         const collectionPath = ctxMenu?.__collectionPath;
@@ -857,6 +1115,17 @@ function AppInner() {
             ?? "对象";
           setRelationModal({ sourceId: targetId, sourceTitle: title });
         }
+    } else if (id === "generate-concept-note") {
+        const targetId = ctxMenu?.__objectId;
+        if (targetId) {
+          try {
+            await apiStartConceptNote([targetId]);
+            toast("info", "已加入影子笔记队列");
+            apiGetConceptNoteStatus(50).then(setShadowNoteStatus).catch(() => undefined);
+          } catch (e: any) {
+            toast("error", `入队失败: ${e}`);
+          }
+        }
       } else if (id === "rename-group") {
         const oldGroup = ctxMenu?.__groupName;
         if (oldGroup) {
@@ -918,7 +1187,7 @@ function AppInner() {
         openNewItem();
       } else if (meta && e.key.toLowerCase() === "i") {
         e.preventDefault();
-        handleImport();
+        openImportChoice();
       } else if (meta && e.key.toLowerCase() === "g" && !e.shiftKey) {
         e.preventDefault();
         setView("graph");
@@ -935,13 +1204,16 @@ function AppInner() {
         if (showCommand) setShowCommand(false);
         else if (showNewNote) setShowNewNote(false);
         else if (showSettings) setShowSettings(false);
+        else if (showVersionHistory) setShowVersionHistory(false);
+        else if (showImportUrl) setShowImportUrl(false);
+        else if (showImportChoice) setShowImportChoice(false);
         else if (relationModal) setRelationModal(null);
         else if (ctxMenu) setCtxMenu(null);
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [handleImport, showCommand, showNewNote, showSettings, relationModal, ctxMenu, activeTabId, saveActiveObject, openNewItem]);
+  }, [openImportChoice, showCommand, showNewNote, showSettings, showVersionHistory, showImportUrl, showImportChoice, relationModal, ctxMenu, activeTabId, saveActiveObject, openNewItem]);
 
   // ===== 拖拽分隔条 =====
   useEffect(() => {
@@ -1121,6 +1393,7 @@ function AppInner() {
         />
       );
     }
+    if (tabs.length === 0) return <EditorEmpty />;
     return (
       <EditorView
         tabs={tabs}
@@ -1134,7 +1407,9 @@ function AppInner() {
         onContentChange={handleContentChange}
         onTitleChange={handleTitleChange}
         onSave={saveActiveObject}
+        onReload={loadObject}
         allObjects={allObjectsForRelation}
+        conceptNote={activeConceptNote}
       />
     );
   };
@@ -1147,8 +1422,15 @@ function AppInner() {
         breadcrumb={breadcrumb}
         onViewChange={setView}
         onNewNote={() => openNewItem()}
-        onImport={handleImport}
-        onImportFolder={handleImportFolder}
+        onImport={openImportChoice}
+        onImportUrl={() => setShowImportUrl(true)}
+        onOpenAiAssistant={() => {
+          setAiOrganizeTarget(null);
+          setShowAiOrganize(true);
+        }}
+        onUndo={handleUndo}
+        onOpenHistory={() => setShowVersionHistory(true)}
+        historyAvailable={Boolean(activeTabId && activeMeta && !["image", "pdf", "attachment"].includes(activeMeta.format))}
         onToggleTheme={() =>
           setTheme((t) => (t === "dark" ? "light" : "dark"))
         }
@@ -1156,6 +1438,70 @@ function AppInner() {
         discoveryCount={discoveryCandidates.length}
         discoveryConfigured={discoveryFolders.length > 0}
         onOpenDiscovery={() => setShowDiscovery(true)}
+        onOpenAgentLink={() => setShowAgentLink(true)}
+        agentLinkPending={agentList.filter((a) => a.configExists && !a.registered).length}
+        shadowNoteCount={shadowNoteStatus ? shadowNoteStatus.pending + shadowNoteStatus.running + shadowNoteStatus.failed : 0}
+        shadowNoteStatus={shadowNoteStatus}
+        shadowPopoverOpen={shadowPopoverOpen}
+        onToggleShadowPopover={() => setShadowPopoverOpen((v) => !v)}
+        onStartConceptNoteBatch={async () => {
+          try {
+            const count = await apiStartConceptNoteBatch();
+            toast("info", `${count} 个任务已加入队列`);
+            const status = await apiGetConceptNoteStatus(50);
+            setShadowNoteStatus(status);
+          } catch (e: any) {
+            toast("error", `批量补全失败: ${e}`);
+          }
+        }}
+        onSetConceptNoteEnabled={async (enabled: boolean) => {
+          // 乐观更新：立即响应点击，后端失败再回滚
+          setShadowNoteStatus((prev) => (prev ? { ...prev, enabled } : prev));
+          try {
+            await apiSetConceptNoteEnabled(enabled);
+            const status = await apiGetConceptNoteStatus(50);
+            setShadowNoteStatus(status);
+            toast("info", enabled ? "影子笔记已开启" : "影子笔记已关闭");
+          } catch (e: any) {
+            setShadowNoteStatus((prev) =>
+              prev ? { ...prev, enabled: !enabled } : prev
+            );
+            toast("error", `设置失败: ${e}`);
+          }
+        }}
+        onSetConceptNotePaused={async (paused: boolean) => {
+          setShadowNoteStatus((prev) => (prev ? { ...prev, paused } : prev));
+          try {
+            await apiSetConceptNotePaused(paused);
+            const status = await apiGetConceptNoteStatus(50);
+            setShadowNoteStatus(status);
+            toast("info", paused ? "队列已暂停" : "队列已恢复");
+          } catch (e: any) {
+            setShadowNoteStatus((prev) =>
+              prev ? { ...prev, paused: !paused } : prev
+            );
+            toast("error", `操作失败: ${e}`);
+          }
+        }}
+        onRetryAllConceptNotes={async () => {
+          try {
+            const count = await apiRetryAllConceptNotes();
+            toast("success", `${count} 个失败任务已重新加入队列`);
+            const status = await apiGetConceptNoteStatus(50);
+            setShadowNoteStatus(status);
+          } catch (e: any) {
+            toast("error", `重试失败: ${e}`);
+          }
+        }}
+        onRetryConceptNote={async (taskId: number) => {
+          try {
+            await apiRetryConceptNotes([taskId]);
+            const status = await apiGetConceptNoteStatus(50);
+            setShadowNoteStatus(status);
+          } catch (e: any) {
+            toast("error", `重试失败: ${e}`);
+          }
+        }}
       />
 
       <div className="app-body">
@@ -1170,14 +1516,10 @@ function AppInner() {
               onContextMenu={setCtxMenu}
               onOpenCommand={() => setShowCommand(true)}
               onNewNote={() => openNewItem()}
-              onImport={handleImport}
-              onNewFolder={handleNewFolder}
-              onAiOrganize={() => {
-                setAiOrganizeTarget(null);
-                setShowAiOrganize(true);
-              }}
+              onImport={openImportChoice}
               onNewObjectInFolder={openNewItem}
               onMoveObject={handleMoveObject}
+              shadowNoteMap={shadowNoteMap}
             />
           </div>
         )}
@@ -1191,14 +1533,10 @@ function AppInner() {
             onContextMenu={setCtxMenu}
             onOpenCommand={() => setShowCommand(true)}
             onNewNote={() => openNewItem()}
-            onImport={handleImport}
-            onNewFolder={handleNewFolder}
-            onAiOrganize={() => {
-              setAiOrganizeTarget(null);
-              setShowAiOrganize(true);
-            }}
+            onImport={openImportChoice}
             onNewObjectInFolder={openNewItem}
             onMoveObject={handleMoveObject}
+            shadowNoteMap={shadowNoteMap}
           />
         )}
 
@@ -1209,7 +1547,11 @@ function AppInner() {
           />
         )}
 
-        <div className="main-content">{renderMainView()}</div>
+        <div className="main-content">
+          <Suspense fallback={<div className="editor-empty" role="status">正在加载…</div>}>
+            {renderMainView()}
+          </Suspense>
+        </div>
 
         {!rightCollapsed && (
           <div
@@ -1253,13 +1595,18 @@ function AppInner() {
         onSelect={handleCtxSelect}
       />
 
-      {/* 弹窗 */}
+      {/* 弹窗按需加载，不阻塞主界面。 */}
+      <Suspense fallback={null}>
       {showNewNote && (
         <NewNoteModal
+          key={newItemInitialLocationId + newItemInitialType}
           onClose={() => setShowNewNote(false)}
           onConfirm={handleCreateNote}
           targetGroup={newItemGroup}
           initialType={newItemInitialType}
+          parentName={newItemParent.parentName}
+          locations={newItemLocations}
+          initialLocationId={newItemInitialLocationId}
         />
       )}
       {showSettings && (
@@ -1280,6 +1627,15 @@ function AppInner() {
           onRefreshTree={refreshTree}
         />
       )}
+      {showAgentLink && (
+        <AgentLinkModal
+          onClose={() => setShowAgentLink(false)}
+          onChange={(list) => {
+            setAgentList(list);
+            setAgentOnline(list.some((a) => a.registered));
+          }}
+        />
+      )}
       {showDiscovery && (
         <FileDiscoveryModal
           candidates={discoveryCandidates}
@@ -1294,11 +1650,47 @@ function AppInner() {
           onClose={() => setShowDiscovery(false)}
         />
       )}
+      {showImportChoice && (
+        <ImportChoiceModal
+          onClose={() => setShowImportChoice(false)}
+          onSelectFiles={importFiles}
+          onSelectFolder={importFolder}
+        />
+      )}
       {showAiOrganize && (
         <AiOrganizeModal
           onClose={() => setShowAiOrganize(false)}
+          onOpenSettings={() => setShowSettings(true)}
           collectionId={aiOrganizeTarget?.collectionId}
           collectionPath={aiOrganizeTarget?.collectionPath}
+        />
+      )}
+      {showVersionHistory && activeTabId && activeMeta && (
+        <VersionHistoryModal
+          objectId={activeTabId}
+          title={activeMeta.title}
+          onClose={() => setShowVersionHistory(false)}
+          onRestored={async () => {
+            await Promise.all([loadObject(activeTabId), refreshTree()]);
+            setRelationVersion((version) => version + 1);
+            toast("success", "已恢复所选正文版本");
+          }}
+        />
+      )}
+      {showImportUrl && (
+        <ImportUrlModal
+          groups={groupNodes.map((group) => group.name).filter(Boolean)}
+          onClose={() => setShowImportUrl(false)}
+          onConfirm={async (url, group) => {
+            const object = await apiImportUrl(url, group);
+            await Promise.all([refreshTree(), refreshStats()]);
+            setTabs((current) => current.some((tab) => tab.id === object.id)
+              ? current
+              : [...current, { id: object.id, title: object.title, type: object.type }]);
+            setActiveTabId(object.id);
+            await loadObject(object.id);
+            toast("success", `网页已入库：${object.title}`);
+          }}
         />
       )}
       {showCommand && (
@@ -1322,6 +1714,8 @@ function AppInner() {
           onClose={() => setRelationModal(null)}
         />
       )}
+
+      </Suspense>
 
       {/* 拖拽遮罩 */}
       {dragOver && <DropOverlay />}

@@ -14,7 +14,10 @@ interface FileTreeProps {
   onSelectObject: (node: TreeNode) => void;
   onContextMenu: (state: ContextMenuState) => void;
   onMoveObject?: (objectId: string, target: string, label?: string) => void;
-  onNewObjectInFolder?: (groupName: string) => void;
+  onNewObjectInFolder?: (groupName: string, collectionId?: string) => void;
+  // 影子笔记（概念笔记）
+  shadowNoteMap?: Record<string, boolean>;
+  onGenerateConceptNote?: (objectId: string) => void;
 }
 
 export function FileTree({
@@ -24,6 +27,7 @@ export function FileTree({
   onContextMenu,
   onMoveObject,
   onNewObjectInFolder,
+  shadowNoteMap,
 }: FileTreeProps) {
   // 默认所有分组展开
   const [expanded, setExpanded] = useState<Record<string, boolean>>(() => {
@@ -70,6 +74,11 @@ export function FileTree({
                   {
                     id: "new-object",
                     label: "在此分组新建对象",
+                  },
+                  {
+                    id: "new-subfolder",
+                    label: "新建子文件夹",
+                    disabled: !node.collectionId,
                   },
                   {
                     id: "ai-organize-collection",
@@ -143,7 +152,7 @@ export function FileTree({
                 title={`在「${node.name}」中新建`}
                 onClick={(e) => {
                   e.stopPropagation();
-                  onNewObjectInFolder(node.collectionPath ?? node.name);
+                  onNewObjectInFolder(node.collectionPath ?? node.name, node.collectionId);
                 }}
               >
                 <IconPlus size={12} />
@@ -215,6 +224,12 @@ export function FileTree({
                     separator: true,
                   },
                   {
+                    id: "generate-concept-note",
+                    label: "生成影子笔记",
+                    icon: "◈",
+                    disabled: shadowNoteMap?.[node.id] === true,
+                  },
+                  {
                     id: "add-relation",
                     label: "添加关系",
                   },
@@ -249,6 +264,16 @@ export function FileTree({
               style={{ color: "var(--green)" }}
             >
               ●
+            </span>
+          )}
+          {shadowNoteMap?.[node.id] === true && (
+            <span
+              className="tree-count shadow-note-mark"
+              title="已生成影子笔记"
+              style={{ color: "var(--accent)" }}
+              aria-hidden="true"
+            >
+              ◈
             </span>
           )}
         </div>

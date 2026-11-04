@@ -28,6 +28,39 @@ interface ParsedMcpConfig {
   >;
 }
 
+type AiProvider = "openai" | "deepseek" | "ollama" | "openai-compatible";
+type AuthMode = "bearer" | "x-api-key" | "custom" | "none";
+
+const providerPresets: Record<Exclude<AiProvider, "openai-compatible">, {
+  baseUrl: string;
+  model: string;
+  authMode: AuthMode;
+}> = {
+  openai: {
+    baseUrl: "https://api.openai.com/v1",
+    model: "gpt-4.1-mini",
+    authMode: "bearer",
+  },
+  deepseek: {
+    baseUrl: "https://api.deepseek.com/v1",
+    model: "deepseek-chat",
+    authMode: "bearer",
+  },
+  ollama: {
+    baseUrl: "http://127.0.0.1:11434/v1",
+    model: "llama3.2",
+    authMode: "none",
+  },
+};
+
+function validateAiEndpoint(baseUrl: string, model: string) {
+  const normalizedBaseUrl = baseUrl.trim().toLowerCase();
+  const normalizedModel = model.trim().toLowerCase();
+  if (normalizedBaseUrl.includes("api.openai.com") && normalizedModel.includes("deepseek")) {
+    throw new Error("Base URL 与模型不匹配：当前地址是 OpenAI，但模型名称是 DeepSeek。请改用模型服务商提供的 Base URL。");
+  }
+}
+
 export function SettingsModal({
   onClose,
   aiEnhanced,
@@ -52,14 +85,21 @@ export function SettingsModal({
   const [backupResult, setBackupResult] = useState<string | null>(null);
   const [rebuildingVault, setRebuildingVault] = useState(false);
   const [rebuildVaultResult, setRebuildVaultResult] = useState<string | null>(null);
+  const [aiProvider, setAiProvider] = useState<AiProvider>("openai-compatible");
   const [aiBaseUrl, setAiBaseUrl] = useState("https://api.openai.com/v1");
   const [aiModel, setAiModel] = useState("");
+  const [embeddingModel, setEmbeddingModel] = useState("");
+  const [authMode, setAuthMode] = useState<AuthMode>("bearer");
+  const [apiKeyHeader, setApiKeyHeader] = useState("Authorization");
+  const [apiKeyPrefix, setApiKeyPrefix] = useState("Bearer ");
   const [aiApiKey, setAiApiKey] = useState("");
   const [aiKeyConfigured, setAiKeyConfigured] = useState(false);
   const [aiHeaders, setAiHeaders] = useState("{}");
   const [savingAi, setSavingAi] = useState(false);
   const [testingAi, setTestingAi] = useState(false);
   const [aiResult, setAiResult] = useState<string | null>(null);
+  const aiEndpointMismatch = aiBaseUrl.trim().toLowerCase().includes("api.openai.com")
+    && aiModel.trim().toLowerCase().includes("deepseek");
 
   useEffect(() => {
     getMcpConfig()
@@ -83,32 +123,53 @@ export function SettingsModal({
       .catch(() => setVaultPath(""));
     getAiConfig()
       .then((config) => {
+        setAiProvider((config.provider as AiProvider) || "openai-compatible");
         setAiBaseUrl(config.base_url);
         setAiModel(config.model);
+        setEmbeddingModel(config.embedding_model || "");
+        setAuthMode(config.auth_mode || "bearer");
+        setApiKeyHeader(config.api_key_header || "Authorization");
+        setApiKeyPrefix(config.api_key_prefix ?? "Bearer ");
         setAiHeaders(JSON.stringify(config.headers || {}, null, 2));
         setAiKeyConfigured(!!config.api_key_configured);
       })
       .catch(() => undefined);
   }, []);
 
+  const handleProviderChange = (provider: AiProvider) => {
+    setAiProvider(provider);
+    setAiResult(null);
+    if (provider === "openai-compatible") return;
+    const preset = providerPresets[provider];
+    setAiBaseUrl(preset.baseUrl);
+    setAiModel(preset.model);
+    setAuthMode(preset.authMode);
+    setApiKeyHeader("Authorization");
+    setApiKeyPrefix("Bearer ");
+  };
+
+  const currentAiConfig = (headers: Record<string, string>) => ({
+    provider: aiProvider,
+    base_url: aiBaseUrl.trim(),
+    model: aiModel.trim(),
+    embedding_model: embeddingModel.trim(),
+    auth_mode: authMode,
+    api_key_header: authMode === "custom" ? apiKeyHeader.trim() : "Authorization",
+    api_key_prefix: authMode === "custom" ? apiKeyPrefix : "Bearer ",
+    headers,
+    max_tool_rounds: 12,
+  });
+
   const handleSaveAi = async () => {
     setSavingAi(true);
     setAiResult(null);
     try {
+      validateAiEndpoint(aiBaseUrl, aiModel);
       const headers = JSON.parse(aiHeaders || "{}");
       if (!headers || Array.isArray(headers) || typeof headers !== "object") {
         throw new Error("自定义 Header 必须是 JSON 对象");
       }
-      await saveAiConfig(
-        {
-          provider: "openai-compatible",
-          base_url: aiBaseUrl.trim(),
-          model: aiModel.trim(),
-          headers,
-          max_tool_rounds: 12,
-        },
-        aiApiKey.trim() || undefined
-      );
+      await saveAiConfig(currentAiConfig(headers), aiApiKey.trim() || undefined);
       if (aiApiKey.trim()) setAiKeyConfigured(true);
       setAiApiKey("");
       setAiResult("✅ 模型配置已保存");
@@ -123,26 +184,26 @@ export function SettingsModal({
     setTestingAi(true);
     setAiResult(null);
     try {
+      validateAiEndpoint(aiBaseUrl, aiModel);
       const headers = JSON.parse(aiHeaders || "{}");
       if (!headers || Array.isArray(headers) || typeof headers !== "object") {
         throw new Error("自定义 Header 必须是 JSON 对象");
       }
-      await saveAiConfig(
-        {
-          provider: "openai-compatible",
-          base_url: aiBaseUrl.trim(),
-          model: aiModel.trim(),
-          headers,
-          max_tool_rounds: 12,
-        },
-        aiApiKey.trim() || undefined
-      );
+      if (authMode !== "none" && !aiApiKey.trim() && !aiKeyConfigured) {
+        throw new Error("当前认证方式需要 API Key，请先填写");
+      }
+      await saveAiConfig(currentAiConfig(headers), aiApiKey.trim() || undefined);
       if (aiApiKey.trim()) setAiKeyConfigured(true);
       setAiApiKey("");
       const result = await testAiConnection();
       setAiResult(`✅ 连接成功：${result.trim() || "OK"}`);
     } catch (e: any) {
-      setAiResult(`连接失败: ${e}`);
+      const message = String(e);
+      if (/401|unauthorized|didn't provide an api key|尚未配置 api key/i.test(message)) {
+        setAiResult("❌ 连接失败：服务端未收到有效 API Key。请重新输入 API Key，点击“保存并测试”；如果使用自定义 Header，请不要覆盖 Authorization。");
+      } else {
+        setAiResult(`连接失败: ${message}`);
+      }
     } finally {
       setTestingAi(false);
     }
@@ -336,8 +397,20 @@ export function SettingsModal({
           <div className="settings-ai-card">
             <div className="settings-label">内置 AI 模型</div>
             <div className="settings-desc" style={{ marginBottom: 10 }}>
-              仅在你手动发起 AI 任务时调用。首版支持 OpenAI-compatible API 和兼容接口。
+              支持 OpenAI、DeepSeek、Ollama 及任意 OpenAI-compatible 接口。选择预设或自由填写服务地址与模型。
             </div>
+            <label className="settings-ai-field">
+              <span>模型服务</span>
+              <select
+                value={aiProvider}
+                onChange={(event) => handleProviderChange(event.target.value as AiProvider)}
+              >
+                <option value="openai">OpenAI</option>
+                <option value="deepseek">DeepSeek</option>
+                <option value="ollama">Ollama / 本地模型</option>
+                <option value="openai-compatible">自定义兼容服务</option>
+              </select>
+            </label>
             <label className="settings-ai-field">
               <span>Base URL</span>
               <input
@@ -345,6 +418,9 @@ export function SettingsModal({
                 onChange={(e) => setAiBaseUrl(e.target.value)}
                 placeholder="https://api.openai.com/v1"
               />
+              <small className="settings-ai-help">
+                填写模型服务商提供的兼容接口地址，例如 OpenAI 或 DeepSeek 的 /v1 地址
+              </small>
             </label>
             <label className="settings-ai-field">
               <span>模型</span>
@@ -353,25 +429,80 @@ export function SettingsModal({
                 onChange={(e) => setAiModel(e.target.value)}
                 placeholder="模型名称"
               />
+              {aiEndpointMismatch && (
+                <small className="settings-ai-endpoint-warning">
+                  当前是 OpenAI 地址，但填写了 DeepSeek 模型，请改成该模型服务商提供的 Base URL
+                </small>
+              )}
             </label>
-            <label className="settings-ai-field">
-              <span>API Key</span>
-              <input
-                type="password"
-                value={aiApiKey}
-                onChange={(e) => setAiApiKey(e.target.value)}
-                placeholder={aiKeyConfigured ? "已安全保存；留空保持不变" : "输入 API Key"}
-              />
-            </label>
-            <label className="settings-ai-field settings-ai-field-stack">
-              <span>自定义 Header（JSON）</span>
-              <textarea
-                value={aiHeaders}
-                onChange={(e) => setAiHeaders(e.target.value)}
-                spellCheck={false}
-                rows={3}
-              />
-            </label>
+            {authMode !== "none" ? (
+              <label className="settings-ai-field">
+                <span>API Key</span>
+                <input
+                  type="password"
+                  value={aiApiKey}
+                  onChange={(e) => setAiApiKey(e.target.value)}
+                  placeholder={aiKeyConfigured ? "已安全保存；留空保持不变" : "输入 API Key"}
+                />
+                <small className={`settings-ai-key-hint${aiKeyConfigured ? " configured" : ""}`}>
+                  {aiKeyConfigured ? "已检测到安全存储的 API Key" : "尚未配置 API Key"}
+                </small>
+              </label>
+            ) : (
+              <div className="settings-ai-no-key">当前服务无需 API Key，适用于本机 Ollama 等无认证接口</div>
+            )}
+            <details className="settings-ai-advanced">
+              <summary>高级设置（可选）</summary>
+              <label className="settings-ai-field">
+                <span>认证方式</span>
+                <select
+                  value={authMode}
+                  onChange={(event) => setAuthMode(event.target.value as AuthMode)}
+                >
+                  <option value="bearer">Bearer API Key</option>
+                  <option value="x-api-key">x-api-key</option>
+                  <option value="custom">自定义认证 Header</option>
+                  <option value="none">无需认证</option>
+                </select>
+              </label>
+              {authMode === "custom" && (
+                <>
+                  <label className="settings-ai-field">
+                    <span>认证 Header</span>
+                    <input
+                      value={apiKeyHeader}
+                      onChange={(event) => setApiKeyHeader(event.target.value)}
+                      placeholder="Authorization"
+                    />
+                  </label>
+                  <label className="settings-ai-field">
+                    <span>Key 前缀</span>
+                    <input
+                      value={apiKeyPrefix}
+                      onChange={(event) => setApiKeyPrefix(event.target.value)}
+                      placeholder="Bearer "
+                    />
+                  </label>
+                </>
+              )}
+              <label className="settings-ai-field">
+                <span>Embedding 模型</span>
+                <input
+                  value={embeddingModel}
+                  onChange={(e) => setEmbeddingModel(e.target.value)}
+                  placeholder="留空即可使用全文检索"
+                />
+              </label>
+              <label className="settings-ai-field settings-ai-field-stack">
+                <span>自定义 Header（JSON）</span>
+                <textarea
+                  value={aiHeaders}
+                  onChange={(e) => setAiHeaders(e.target.value)}
+                  spellCheck={false}
+                  rows={3}
+                />
+              </label>
+            </details>
             {aiResult && (
               <div className={aiResult.includes("失败") ? "settings-ai-result error" : "settings-ai-result"}>
                 {aiResult}

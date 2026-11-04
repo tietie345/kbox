@@ -8,15 +8,14 @@
 // - 工具执行层必须同时完成 SQLite、FTS、objects/{id}/index.md 与操作日志的更新，
 //   不允许 Agent 绕过 KnowledgeBase 只改数据库。
 // - 只读 / 全局工具（search、get_object、list_objects、list_groups、list_tags 等）不受作用域限制。
-// - 面向单个对象的写工具（update_content、delete_object、link_objects）必须经 TaskScope 校验，
-//   越界即拒绝。
+// - TaskScope 只记录任务发起时的目录上下文，不构成硬授权边界；AI 可按任务需要操作整库对象。
+// - 永久删除不提供工具；delete_object 仍然是可撤销的软删除。
 
 use crate::db;
 use crate::ingest::KnowledgeBase;
 use crate::model::CollectionNode;
 use rusqlite::params;
 use serde_json::{json, Value};
-use std::collections::HashSet;
 
 /// 工具元定义。`input_schema` 是 MCP tools/list 的 `inputSchema`，OpenAI-compatible 的 tool 定义也复用。
 #[derive(Debug, Clone)]
@@ -55,12 +54,12 @@ impl ToolResult {
     }
 }
 
-/// 工具授权作用域。内置整理任务必须携带，MCP / CLI 默认整库无限制。
+/// AI 任务上下文。Collection 仅用于提示当前关注目录，不构成硬权限边界。
 #[derive(Debug, Clone)]
 pub enum TaskScope {
     /// 整个知识库（MCP / CLI 默认路径，不限对象）
     KnowledgeBase,
-    /// 限定某个 Collection 子树（含后代），越界对象拒绝
+    /// 任务发起时聚焦的 Collection 子树。该值仅作为上下文展示，不限制 AI 的整库操作能力。
     Collection { id: String },
 }
 
@@ -70,50 +69,13 @@ impl TaskScope {
         matches!(self, TaskScope::KnowledgeBase)
     }
 
-    /// 解析 Collection scope 的子树对象 id 集合；全局返回 None。
-    fn collection_object_ids(&self, kb: &KnowledgeBase) -> Result<Option<HashSet<String>>, String> {
-        let id = match self {
-            TaskScope::KnowledgeBase => return Ok(None),
-            TaskScope::Collection { id } => id.clone(),
-        };
-        let tree = kb.get_collection_tree().map_err(|e| e.to_string())?;
-
-        fn find<'a>(node: &'a CollectionNode, id: &str) -> Option<&'a CollectionNode> {
-            if node.id == id {
-                return Some(node);
-            }
-            node.children.iter().find_map(|c| find(c, id))
-        }
-        fn collect(node: &CollectionNode, ids: &mut HashSet<String>) {
-            ids.extend(node.objects.iter().map(|o| o.id.clone()));
-            for child in &node.children {
-                collect(child, ids);
-            }
-        }
-
-        let root = tree
-            .iter()
-            .find_map(|n| find(n, &id))
-            .ok_or_else(|| format!("目录不存在或已被删除: {id}"))?;
-        let mut ids = HashSet::new();
-        collect(root, &mut ids);
-        Ok(Some(ids))
-    }
-
-    /// 校验对象是否在作用域内；越界返回 Err。全局作用域恒通过。
+    /// 兼容旧调用点。目录作用域是上下文，不再拒绝越界对象。
     pub fn ensure_object_in_scope(
         &self,
-        kb: &KnowledgeBase,
-        object_id: &str,
+        _kb: &KnowledgeBase,
+        _object_id: &str,
     ) -> Result<(), String> {
-        let Some(ids) = self.collection_object_ids(kb)? else {
-            return Ok(());
-        };
-        if ids.contains(object_id) {
-            Ok(())
-        } else {
-            Err(format!("对象 {object_id} 不在当前整理作用域内"))
-        }
+        Ok(())
     }
 }
 
@@ -134,7 +96,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "ingest_url",
-            description: "将远程 URL 内容入库到知识库（占位，后续实现）",
+            description: "抓取远程 HTTP/HTTPS 网页正文并入库到知识库",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -142,6 +104,17 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "group": { "type": "string", "description": "分组名（可选）" }
                 },
                 "required": ["url"]
+            }),
+        },
+        ToolDefinition {
+            name: "ocr_object",
+            description: "使用本机离线 OCR 提取图片对象中的中英文文字并加入检索索引",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "图片对象 ID" }
+                },
+                "required": ["id"]
             }),
         },
         ToolDefinition {
@@ -275,7 +248,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "create_collection",
-            description: "在知识库中建立目录（Collection），按「一级/二级/...」路径自动逐级创建。仅允许在授权范围内创建。",
+            description: "在知识库中建立目录（Collection），按「一级/二级/...」路径自动逐级创建。",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -287,7 +260,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "move_object",
-            description: "把对象移动到指定目录（Collection）下。目标目录必须在授权范围内。",
+            description: "把对象移动到指定目录（Collection）下。",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -299,11 +272,47 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "archive_object",
-            description: "把对象移动到「归档」目录（软归档，并非永久删除）。仅允许归档授权范围内的对象。",
+            description: "把对象移动到「归档」目录（软归档，并非永久删除）。",
             input_schema: json!({
                 "type": "object",
                 "properties": { "id": { "type": "string" } },
                 "required": ["id"]
+            }),
+        },
+        ToolDefinition {
+            name: "add_tags",
+            description: "给对象追加标签，并同步索引与 index.md",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "tags": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["id", "tags"]
+            }),
+        },
+        ToolDefinition {
+            name: "update_metadata",
+            description: "合并更新对象 metadata；值为 null 时删除对应字段",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "metadata": { "type": "object" }
+                },
+                "required": ["id", "metadata"]
+            }),
+        },
+        ToolDefinition {
+            name: "export",
+            description: "导出单个对象或整个知识库为 ZIP",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "destination_path": { "type": "string", "description": "输出 .zip 文件的绝对路径" },
+                    "object_id": { "type": "string", "description": "可选；仅导出指定对象" }
+                },
+                "required": ["destination_path"]
             }),
         },
     ]
@@ -325,11 +334,12 @@ pub fn tools_list_json() -> Value {
 // ---------------------------------------------------------------------------
 
 /// 执行一次工具调用。全局/只读工具行为与旧 MCP 一致；
-/// 对面向单个对象的写工具做 TaskScope 作用域校验。
+/// 执行一次工具调用。TaskScope 仅用于保留任务上下文，不限制工具操作范围。
 pub fn execute_tool(kb: &KnowledgeBase, call: &ToolCall, scope: &TaskScope) -> ToolResult {
     let result = match call.name.as_str() {
         "ingest_file" => tool_ingest_file(kb, &call.arguments),
-        "ingest_url" => tool_ingest_url(&call.arguments),
+        "ingest_url" => tool_ingest_url(kb, &call.arguments),
+        "ocr_object" => tool_ocr_object(kb, &call.arguments, scope),
         "create_note" => tool_create_note(kb, &call.arguments),
         "search" => tool_search(kb, &call.arguments),
         "get_object" => tool_get_object(kb, &call.arguments),
@@ -348,6 +358,9 @@ pub fn execute_tool(kb: &KnowledgeBase, call: &ToolCall, scope: &TaskScope) -> T
         "create_collection" => tool_create_collection(kb, &call.arguments, scope),
         "move_object" => tool_move_object(kb, &call.arguments, scope),
         "archive_object" => tool_archive_object(kb, &call.arguments, scope),
+        "add_tags" => tool_add_tags(kb, &call.arguments, scope),
+        "update_metadata" => tool_update_metadata(kb, &call.arguments, scope),
+        "export" => tool_export(kb, &call.arguments, scope),
         other => Err(format!("未知工具: {other}")),
     };
     match result {
@@ -373,9 +386,26 @@ fn tool_ingest_file(kb: &KnowledgeBase, args: &Value) -> ToolOut {
     }
 }
 
-fn tool_ingest_url(args: &Value) -> ToolOut {
+fn tool_ingest_url(kb: &KnowledgeBase, args: &Value) -> ToolOut {
     let url = args["url"].as_str().unwrap_or("");
-    Err(format!("ingest_url 暂未实现，收到 URL: {url}"))
+    if url.trim().is_empty() {
+        return Err("缺少 url 参数".to_string());
+    }
+    let group = args.get("group").and_then(Value::as_str);
+    kb.ingest_url_as(url, group, "agent")
+        .map(|object| format!("已入库网页: {} (id: {})", object.title, object.id))
+        .map_err(|error| format!("网页入库失败: {error}"))
+}
+
+fn tool_ocr_object(kb: &KnowledgeBase, args: &Value, scope: &TaskScope) -> ToolOut {
+    let id = args["id"].as_str().unwrap_or("");
+    if id.is_empty() {
+        return Err("缺少 id 参数".to_string());
+    }
+    scope.ensure_object_in_scope(kb, id)?;
+    kb.ocr_object(id)
+        .map(|text| format!("OCR 完成，共提取 {} 个字符", text.chars().count()))
+        .map_err(|error| format!("OCR 失败: {error}"))
 }
 
 fn tool_create_note(kb: &KnowledgeBase, args: &Value) -> ToolOut {
@@ -524,7 +554,7 @@ fn tool_link_objects(kb: &KnowledgeBase, args: &Value, scope: &TaskScope) -> Too
     scope.ensure_object_in_scope(kb, from_id)?;
     scope.ensure_object_in_scope(kb, to_id)?;
     let conn = kb.conn().map_err(|e| format!("数据库连接失败: {e}"))?;
-    match db::link_objects(&conn, from_id, to_id, relation_type) {
+    match db::link_objects_manual(&conn, from_id, to_id, relation_type) {
         Ok(()) => Ok(format!(
             "已建立关系: {} --{}--> {}",
             from_id, relation_type, to_id
@@ -735,39 +765,18 @@ fn tool_list_collections(kb: &KnowledgeBase) -> ToolOut {
     }
 }
 
-/// 校验目标目录 path 是否在授权 Collection 范围内（全局范围不限）。
-fn path_within_scope(kb: &KnowledgeBase, scope: &TaskScope, path: &str) -> Result<(), String> {
-    let TaskScope::Collection { id } = scope else {
-        return Ok(());
-    };
-    let conn = kb.conn().map_err(|e| format!("数据库连接失败: {e}"))?;
-    let scope_path = db::collection_path(&conn, id).map_err(|e| e.to_string())?;
-    if path == scope_path || path.starts_with(&format!("{scope_path}/")) {
-        Ok(())
-    } else {
-        Err(format!("目录「{path}」超出授权范围「{scope_path}」"))
-    }
+/// 兼容旧调用点；目录路径不再受 TaskScope 限制。
+fn path_within_scope(_kb: &KnowledgeBase, _scope: &TaskScope, _path: &str) -> Result<(), String> {
+    Ok(())
 }
 
-/// 校验目标 Collection id 是否在授权范围内（全局范围不限）。
+/// 兼容旧调用点；目标 Collection 不受 TaskScope 限制。
 fn collection_within_scope(
-    kb: &KnowledgeBase,
-    scope: &TaskScope,
-    collection_id: &str,
+    _kb: &KnowledgeBase,
+    _scope: &TaskScope,
+    _collection_id: &str,
 ) -> Result<(), String> {
-    let TaskScope::Collection { id } = scope else {
-        return Ok(());
-    };
-    let conn = kb.conn().map_err(|e| format!("数据库连接失败: {e}"))?;
-    let scope_path = db::collection_path(&conn, id).map_err(|e| e.to_string())?;
-    let target_path = db::collection_path(&conn, collection_id).map_err(|e| e.to_string())?;
-    if target_path == scope_path || target_path.starts_with(&format!("{scope_path}/")) {
-        Ok(())
-    } else {
-        Err(format!(
-            "目标目录「{target_path}」超出授权范围「{scope_path}」"
-        ))
-    }
+    Ok(())
 }
 
 fn tool_create_collection(kb: &KnowledgeBase, args: &Value, scope: &TaskScope) -> ToolOut {
@@ -814,9 +823,12 @@ fn tool_archive_object(kb: &KnowledgeBase, args: &Value, scope: &TaskScope) -> T
     let archive_path = match scope {
         TaskScope::KnowledgeBase => "归档".to_string(),
         TaskScope::Collection { id } => {
-            let conn = kb.conn().map_err(|e| format!("数据库连接失败: {e}"))?;
-            let path = db::collection_path(&conn, id).map_err(|e| e.to_string())?;
-            format!("{path}/归档")
+            let path = kb
+                .conn()
+                .ok()
+                .and_then(|conn| db::collection_path(&conn, id).ok());
+            path.map(|path| format!("{path}/归档"))
+                .unwrap_or_else(|| "归档".to_string())
         }
     };
     let collection_id = kb
@@ -826,6 +838,52 @@ fn tool_archive_object(kb: &KnowledgeBase, args: &Value, scope: &TaskScope) -> T
         Ok(()) => Ok(format!("已归档对象「{id}」到「{archive_path}」")),
         Err(e) => Err(format!("归档失败: {e}")),
     }
+}
+
+fn tool_add_tags(kb: &KnowledgeBase, args: &Value, scope: &TaskScope) -> ToolOut {
+    let id = args["id"].as_str().unwrap_or("");
+    let tags = args["tags"]
+        .as_array()
+        .ok_or_else(|| "tags 必须是字符串数组".to_string())?
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    if id.is_empty() || tags.is_empty() {
+        return Err("缺少 id 或有效 tags".to_string());
+    }
+    scope.ensure_object_in_scope(kb, id)?;
+    kb.add_object_tags(id, &tags)
+        .map(|all| format!("已更新标签: {}", all.join(", ")))
+        .map_err(|error| format!("标签更新失败: {error}"))
+}
+
+fn tool_update_metadata(kb: &KnowledgeBase, args: &Value, scope: &TaskScope) -> ToolOut {
+    let id = args["id"].as_str().unwrap_or("");
+    let metadata = args
+        .get("metadata")
+        .ok_or_else(|| "缺少 metadata".to_string())?;
+    if id.is_empty() {
+        return Err("缺少 id".to_string());
+    }
+    scope.ensure_object_in_scope(kb, id)?;
+    kb.update_object_metadata(id, metadata)
+        .map(|value| format!("已更新 metadata: {value}"))
+        .map_err(|error| format!("metadata 更新失败: {error}"))
+}
+
+fn tool_export(kb: &KnowledgeBase, args: &Value, _scope: &TaskScope) -> ToolOut {
+    let destination = args["destination_path"].as_str().unwrap_or("");
+    if destination.is_empty() {
+        return Err("缺少 destination_path".to_string());
+    }
+    let object_id = args.get("object_id").and_then(|value| value.as_str());
+    let path = std::path::Path::new(destination);
+    if path.extension().and_then(|ext| ext.to_str()) != Some("zip") {
+        return Err("destination_path 必须以 .zip 结尾".to_string());
+    }
+    kb.export_zip(path, object_id)
+        .map(|count| format!("已导出 {count} 个对象到 {}", path.display()))
+        .map_err(|error| format!("导出失败: {error}"))
 }
 
 #[cfg(test)]
@@ -880,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn collection_scope_rejects_out_of_scope_and_unknown_collection() {
+    fn collection_scope_is_context_only() {
         let (_tmp, kb) = setup_vault();
         let in_obj = kb
             .create_note_as("对象A", "concept", "收件箱", "human")
@@ -896,16 +954,16 @@ mod tests {
 
         let scope = TaskScope::Collection { id: col_id.clone() };
         assert!(scope.ensure_object_in_scope(&kb, &in_obj.id).is_ok());
-        assert!(scope.ensure_object_in_scope(&kb, &out_obj.id).is_err());
+        assert!(scope.ensure_object_in_scope(&kb, &out_obj.id).is_ok());
 
         let bogus = TaskScope::Collection {
             id: "does-not-exist".to_string(),
         };
-        assert!(bogus.ensure_object_in_scope(&kb, &in_obj.id).is_err());
+        assert!(bogus.ensure_object_in_scope(&kb, &in_obj.id).is_ok());
     }
 
     #[test]
-    fn delete_object_out_of_scope_is_rejected() {
+    fn delete_object_out_of_scope_is_allowed() {
         let (_tmp, kb) = setup_vault();
         let in_obj = kb
             .create_note_as("对象A", "concept", "收件箱", "human")
@@ -930,7 +988,7 @@ mod tests {
         );
         assert!(!ok.is_error, "scope 内对象应可删除: {}", ok.content);
 
-        let denied = execute_tool(
+        let allowed = execute_tool(
             &kb,
             &ToolCall {
                 name: "delete_object".into(),
@@ -938,11 +996,10 @@ mod tests {
             },
             &scope,
         );
-        assert!(denied.is_error, "越界对象应被拒绝");
         assert!(
-            denied.content.contains("不在当前整理作用域内"),
-            "{}",
-            denied.content
+            !allowed.is_error,
+            "上下文外对象也应可操作: {}",
+            allowed.content
         );
     }
 
@@ -977,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn create_collection_respects_scope() {
+    fn create_collection_ignores_scope_for_autonomous_ai() {
         let (_tmp, kb) = setup_vault();
         let col_id = kb
             .ensure_collection_path("项目/KBOX", "测试目录", "human")
@@ -994,7 +1051,7 @@ mod tests {
         );
         assert!(!ok.is_error, "范围内建目录应成功: {}", ok.content);
 
-        let denied = execute_tool(
+        let allowed = execute_tool(
             &kb,
             &ToolCall {
                 name: "create_collection".into(),
@@ -1002,16 +1059,15 @@ mod tests {
             },
             &scope,
         );
-        assert!(denied.is_error, "越界目录应被拒绝");
         assert!(
-            denied.content.contains("超出授权范围"),
-            "{}",
-            denied.content
+            !allowed.is_error,
+            "上下文外目录也应可创建: {}",
+            allowed.content
         );
     }
 
     #[test]
-    fn move_object_respects_scope() {
+    fn move_object_ignores_scope_for_autonomous_ai() {
         let (_tmp, kb) = setup_vault();
         let in_obj = kb
             .create_note_as("对象A", "concept", "收件箱", "human")
@@ -1036,7 +1092,7 @@ mod tests {
         );
         assert!(!within.is_error, "scope 内对象可移动: {}", within.content);
 
-        let denied = execute_tool(
+        let allowed = execute_tool(
             &kb,
             &ToolCall {
                 name: "move_object".into(),
@@ -1044,11 +1100,10 @@ mod tests {
             },
             &scope,
         );
-        assert!(denied.is_error, "越界对象应被拒绝");
         assert!(
-            denied.content.contains("不在当前整理作用域内"),
-            "{}",
-            denied.content
+            !allowed.is_error,
+            "上下文外对象也应可移动: {}",
+            allowed.content
         );
     }
 
@@ -1071,5 +1126,71 @@ mod tests {
         // 归档后应位于「归档」目录
         let detail = kb.get_object_detail(&obj.id).expect("detail");
         assert_eq!(detail.0.group_name, "归档");
+    }
+
+    #[test]
+    fn metadata_tag_and_export_tools_are_complete() {
+        let (tmp, kb) = setup_vault();
+        let obj = kb
+            .create_note_as("工具测试", "concept", "收件箱", "human")
+            .expect("object");
+        for (name, arguments) in [
+            (
+                "add_tags",
+                json!({ "id": obj.id, "tags": ["KBOX", "重要"] }),
+            ),
+            (
+                "update_metadata",
+                json!({ "id": obj.id, "metadata": { "owner": "研发" } }),
+            ),
+        ] {
+            let result = execute_tool(
+                &kb,
+                &ToolCall {
+                    name: name.to_string(),
+                    arguments,
+                },
+                &TaskScope::KnowledgeBase,
+            );
+            assert!(!result.is_error, "{name}: {}", result.content);
+        }
+        let (detail, tags, _) = kb.get_object_detail(&obj.id).expect("detail");
+        assert_eq!(tags, vec!["KBOX", "重要"]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&detail.metadata).unwrap()["owner"],
+            "研发"
+        );
+
+        let output = tmp.path().join("export.zip");
+        let result = execute_tool(
+            &kb,
+            &ToolCall {
+                name: "export".to_string(),
+                arguments: json!({
+                    "destination_path": output.to_string_lossy(),
+                    "object_id": obj.id
+                }),
+            },
+            &TaskScope::KnowledgeBase,
+        );
+        assert!(!result.is_error, "{}", result.content);
+        assert!(output.exists());
+        assert!(std::fs::metadata(output).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn ingest_url_is_implemented_and_blocks_private_targets() {
+        let (_tmp, kb) = setup_vault();
+        let result = execute_tool(
+            &kb,
+            &ToolCall {
+                name: "ingest_url".to_string(),
+                arguments: json!({"url": "http://127.0.0.1/private"}),
+            },
+            &TaskScope::KnowledgeBase,
+        );
+        assert!(result.is_error);
+        assert!(result.content.contains("内网"));
+        assert!(!result.content.contains("暂未实现"));
     }
 }

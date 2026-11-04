@@ -75,6 +75,10 @@ export interface AiConfig {
   provider: string;
   base_url: string;
   model: string;
+  embedding_model: string;
+  auth_mode: "bearer" | "x-api-key" | "custom" | "none";
+  api_key_header: string;
+  api_key_prefix: string;
   headers: Record<string, string>;
   max_tool_rounds: number;
   api_key_configured?: boolean;
@@ -87,6 +91,10 @@ export async function getFileTree(): Promise<GroupNode[]> {
 
 export async function getCollectionTree(): Promise<CollectionNode[]> {
   return invoke("get_collection_tree");
+}
+
+export async function importUrl(url: string, group: string): Promise<ObjectData> {
+  return invoke("import_url", { url, group });
 }
 
 export async function createCollection(
@@ -178,6 +186,23 @@ export async function checkAgentConfig(): Promise<boolean> {
   return invoke("check_agent_config");
 }
 
+export interface AgentStatus {
+  id: string;
+  name: string;
+  format: string;
+  configPath: string;
+  configExists: boolean;
+  registered: boolean;
+}
+
+export async function detectAgents(): Promise<AgentStatus[]> {
+  return invoke("detect_agents");
+}
+
+export async function linkAgent(id: string): Promise<AgentStatus> {
+  return invoke("link_agent", { id });
+}
+
 export async function getVaultPath(): Promise<string> {
   return invoke("get_vault_path");
 }
@@ -243,19 +268,26 @@ export interface AiTaskAction {
 
 export interface AiTaskEvent {
   task_id: string;
-  kind: "started" | "action" | "completed" | "failed" | "cancelled";
+  kind: "started" | "stream" | "action" | "completed" | "failed" | "cancelled";
   description: string;
   result: AiOrganizeResult | null;
 }
 
+export interface AiConversationTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export async function startAiOrganize(
   instruction: string,
-  collectionId?: string
+  collectionId?: string,
+  conversationContext: AiConversationTurn[] = []
 ): Promise<string> {
   return invoke("start_ai_organize", {
     instruction,
     scope: collectionId ? "collection" : "knowledge_base",
     collectionId: collectionId || null,
+    conversationContext,
   });
 }
 
@@ -269,6 +301,16 @@ export async function getAiTasks(limit = 30): Promise<AiTask[]> {
 
 export async function getAiTaskActions(taskId: string): Promise<AiTaskAction[]> {
   return invoke("get_ai_task_actions", { taskId });
+}
+
+/** 删除单条已结束的 AI 任务（正在运行的任务后端会拒绝） */
+export async function deleteAiTask(taskId: string): Promise<void> {
+  return invoke("delete_ai_task", { taskId });
+}
+
+/** 清空所有已结束的 AI 任务，返回删除条数 */
+export async function clearAiTasks(): Promise<number> {
+  return invoke("clear_ai_tasks");
 }
 
 export async function resetVault(): Promise<void> {
@@ -364,11 +406,33 @@ export async function getAssetUrl(objectId: string): Promise<string | null> {
   return invoke("get_asset_url", { objectId });
 }
 
+export async function openAsset(objectId: string): Promise<void> {
+  return invoke("open_asset", { objectId });
+}
+
 /**
  * 获取对象主资产的 base64 data URL（用于图片/PDF 预览）。
  */
 export async function getAssetBase64(objectId: string): Promise<string | null> {
   return invoke("get_asset_base64", { objectId });
+}
+
+export interface PasteImageResult {
+  id: string;
+  title: string;
+  format: string;
+  format_detail: string;
+}
+
+/**
+ * 将粘贴的图片 data URL 保存为库内图片对象，返回对象信息供编辑器中引用。
+ */
+export async function importImageBytes(
+  dataUrl: string,
+  group?: string,
+  fileName?: string,
+): Promise<PasteImageResult> {
+  return invoke("import_image_bytes", { dataUrl, group, fileName });
 }
 
 // ===== 关系管理（阶段 5） =====
@@ -471,6 +535,38 @@ export async function getOperationLog(
   return invoke("get_operation_log", { limit });
 }
 
+export async function undoLastOperation(): Promise<string> {
+  return invoke("undo_last_operation");
+}
+
+export interface ObjectVersion {
+  operation_id: number;
+  timestamp: number;
+  title: string;
+  content: string;
+}
+
+export interface SyncReport {
+  changed_object_ids: string[];
+  rebuilt: boolean;
+}
+
+export async function getObjectVersions(id: string, limit = 30): Promise<ObjectVersion[]> {
+  return invoke("get_object_versions", { id, limit });
+}
+
+export async function restoreObjectVersion(id: string, operationId: number): Promise<void> {
+  return invoke("restore_object_version", { id, operationId });
+}
+
+export async function runOcr(id: string): Promise<string> {
+  return invoke("ocr_object", { id });
+}
+
+export async function syncExternalChanges(): Promise<SyncReport> {
+  return invoke("sync_external_changes");
+}
+
 /**
  * 递归查询关联关系（深度 N）。
  * 从指定对象出发，沿出链遍历，返回所有深度 ≤ max_depth 的关联对象。
@@ -480,4 +576,86 @@ export async function getRelationsRecursive(
   maxDepth?: number
 ): Promise<RelationData[]> {
   return invoke("get_relations_recursive", { id, maxDepth });
+}
+
+// ===== 影子笔记（概念笔记）=====
+
+export interface ConceptNoteTask {
+  id: number;
+  object_id: string;
+  object_title: string;
+  object_format: string;
+  content_hash: string;
+  status: "pending" | "running" | "done" | "failed";
+  retry_count: number;
+  error_message: string | null;
+  enqueued_at: number;
+  finished_at: number | null;
+}
+
+export interface ConceptNoteStatus {
+  pending: number;
+  running: number;
+  done: number;
+  failed: number;
+  paused: boolean;
+  enabled: boolean;
+  tasks: ConceptNoteTask[];
+}
+
+export interface ConceptNoteEvent {
+  task_id: number | null;
+  object_id: string | null;
+  object_title: string | null;
+  kind: "started" | "completed" | "failed" | "progress";
+  description: string;
+  pending: number;
+  running: number;
+  done: number;
+  failed: number;
+}
+
+/** 为指定对象入队生成概念笔记 */
+export async function startConceptNote(objectIds: string[]): Promise<number> {
+  return invoke("start_concept_note", { objectIds });
+}
+
+/** 批量入队所有需要生成概念笔记的对象 */
+export async function startConceptNoteBatch(): Promise<number> {
+  return invoke("start_concept_note_batch");
+}
+
+/** 获取队列状态 */
+export async function getConceptNoteStatus(limit?: number): Promise<ConceptNoteStatus> {
+  return invoke("get_concept_note_status", { limit: limit ?? null });
+}
+
+/** 暂停/恢复队列 */
+export async function setConceptNotePaused(paused: boolean): Promise<void> {
+  return invoke("set_concept_note_paused", { paused });
+}
+
+/** 设置影子笔记功能开关 */
+export async function setConceptNoteEnabled(enabled: boolean): Promise<void> {
+  return invoke("set_concept_note_enabled", { enabled });
+}
+
+/** 重试失败的任务 */
+export async function retryConceptNotes(taskIds: number[]): Promise<number> {
+  return invoke("retry_concept_notes", { taskIds });
+}
+
+/** 重试所有失败任务 */
+export async function retryAllConceptNotes(): Promise<number> {
+  return invoke("retry_all_concept_notes");
+}
+
+/** 检查对象是否已生成概念笔记 */
+export async function checkConceptNote(objectId: string): Promise<boolean> {
+  return invoke("check_concept_note", { objectId });
+}
+
+/** 丢弃已有概念摘要并强制重新生成（会对扫描件自动 OCR） */
+export async function regenerateConceptNote(objectId: string): Promise<void> {
+  return invoke("regenerate_concept_note", { objectId });
 }

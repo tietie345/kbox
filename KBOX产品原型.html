@@ -91,9 +91,13 @@
     .mode { margin-left: auto; display: flex; gap: 3px; }
     .mode button { border: 0; padding: 5px 9px; border-radius: 5px; background: transparent; color: var(--muted); }
     .mode button.active { color: var(--text); background: var(--soft); }
-    .editor { flex: 1; padding: 30px 38px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #454950; }
+    .editor { flex: 1; padding: 30px 38px 100px; overflow: auto; outline: none; font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; color: #454950; line-height: 1.75; }
     .editor h1 { font: 600 24px -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; margin: 0 0 24px; color: #2b2d32; }
-    .editor p { line-height: 1.8; }
+    .editor h2 { margin: 22px 0 8px; font-size: 18px; }
+    .editor p { margin: 7px 0; }
+    .editor ul { margin: 7px 0; padding-left: 23px; }
+    .editor li { margin: 4px 0; }
+    .editor:focus { box-shadow: inset 0 0 0 1px rgba(127,109,242,.12); }
 
     .right { width: 265px; flex-shrink: 0; background: var(--side); border-left: 1px solid var(--line); }
     .right-head { height: 36px; display: flex; align-items: center; justify-content: space-between; padding: 0 9px 0 12px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; font-weight: 600; }
@@ -136,6 +140,162 @@
     .btn.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
     .btn:disabled { opacity: .42; cursor: not-allowed; }
 
+    /* AI 助手：沿用本页的颜色、边框、圆角和字体，仅作为右侧抽屉叠加 */
+    .ai-layer { position: fixed; inset: 0; z-index: 25; display: none; background: rgba(28, 30, 36, .24); }
+    .ai-layer.show { display: block; }
+    .ai-drawer { position: absolute; top: 0; right: 0; display: flex; width: min(430px, calc(100vw - 24px)); height: 100%; flex-direction: column; overflow: hidden; background: var(--bg); border-left: 1px solid var(--line); box-shadow: var(--shadow); }
+    .ai-head { flex-shrink: 0; padding: 16px; border-bottom: 1px solid var(--line); }
+    .ai-head-row { display: flex; align-items: flex-start; gap: 10px; }
+    .ai-title { margin: 0; font-size: 15px; font-weight: 600; }
+    .ai-subtitle { margin-top: 3px; color: var(--muted); font-size: 11px; }
+    .ai-head .icon-btn { margin-left: auto; }
+    .ai-scope { display: flex; align-items: center; gap: 7px; margin-top: 12px; color: var(--sub); font-size: 10px; }
+    .ai-chip { padding: 3px 7px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); }
+    .ai-chip.connected { border-color: #bfe8d5; color: var(--green); }
+    .ai-spacer { flex: 1; }
+    .ai-clear { padding: 3px 5px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); font-size: 10px; }
+    .ai-clear:hover { background: var(--soft); color: var(--text); }
+    .ai-tabs { display: flex; gap: 2px; margin-top: 12px; padding: 2px; border-radius: 6px; background: var(--soft); }
+    .ai-tab { flex: 1; padding: 5px 7px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); font-size: 11px; }
+    .ai-tab.active { color: var(--text); background: var(--bg); box-shadow: 0 1px 3px rgba(28, 31, 38, .1); }
+    .ai-config-warning { display: flex; gap: 8px; margin: 12px 16px 0; padding: 9px 10px; border: 1px solid #d5cffd; border-radius: 6px; background: var(--accent-soft); color: var(--sub); font-size: 10px; line-height: 1.5; }
+    .ai-config-warning strong { display: block; color: var(--text); font-size: 11px; }
+    .ai-config-warning button { margin-top: 4px; padding: 3px 6px; border: 0; border-radius: 4px; color: #fff; background: var(--accent); font-size: 10px; }
+    .ai-conversation { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: 9px; overflow: auto; padding: 16px; }
+    .ai-welcome { display: flex; gap: 8px; color: var(--sub); font-size: 11px; }
+    .ai-avatar { display: grid; width: 24px; height: 24px; flex: 0 0 24px; place-items: center; border: 1px solid #cfc8ff; border-radius: 6px; background: var(--accent-soft); color: var(--accent); font-size: 12px; }
+    .ai-welcome strong { display: block; margin-bottom: 2px; color: var(--text); font-size: 12px; }
+    .ai-welcome span { display: block; line-height: 1.6; }
+    .ai-suggestions { display: flex; flex-wrap: wrap; gap: 5px; margin-left: 32px; }
+    .ai-suggestion { padding: 4px 7px; border: 1px solid var(--line); border-radius: 4px; background: transparent; color: var(--sub); font-size: 10px; }
+    .ai-suggestion:hover { border-color: var(--accent); color: var(--accent); }
+    .ai-empty { display: flex; min-height: 240px; align-items: center; justify-content: center; flex-direction: column; gap: 8px; color: var(--muted); text-align: center; font-size: 11px; }
+    .ai-empty strong { color: var(--text); font-size: 14px; }
+    .ai-empty span { max-width: 280px; line-height: 1.6; }
+    .ai-empty-icon { display: grid; width: 38px; height: 38px; place-items: center; margin-bottom: 4px; border: 1px solid var(--accent); border-radius: 12px; color: var(--accent); font-size: 20px; }
+    .ai-message { display: flex; gap: 8px; align-items: flex-start; }
+    .ai-message.user { justify-content: flex-end; }
+    .ai-bubble { max-width: 88%; padding: 8px 10px; border-radius: 7px; color: var(--sub); font-size: 11px; line-height: 1.6; white-space: pre-wrap; }
+    .ai-message.assistant .ai-bubble { border: 1px solid var(--line); border-bottom-left-radius: 3px; background: var(--soft); }
+    .ai-message.user .ai-bubble { border-bottom-right-radius: 3px; background: var(--accent); color: #fff; }
+    .ai-result { margin-top: 7px; padding: 7px 8px; border: 1px solid #ddd9ff; border-radius: 5px; background: var(--accent-soft); }
+    .ai-result-title { margin-bottom: 4px; color: #5c50bf; font-size: 10px; font-weight: 600; }
+    .ai-result-grid { display: flex; gap: 14px; }
+    .ai-stat b { display: block; color: var(--text); font-size: 14px; }
+    .ai-stat span { color: var(--muted); font-size: 9px; }
+    .ai-activity { flex-shrink: 0; margin: 0 16px 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); }
+    .ai-activity-head { display: flex; align-items: center; gap: 6px; color: var(--sub); font-size: 10px; }
+    .ai-activity-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
+    .ai-activity-head time { margin-left: auto; color: var(--muted); font-size: 9px; }
+    .ai-activity-list { display: grid; gap: 3px; margin-top: 5px; color: var(--muted); font-size: 10px; }
+    .ai-activity-list i { margin-right: 4px; color: var(--green); font-style: normal; }
+    .ai-composer { flex-shrink: 0; padding: 0 16px 14px; }
+    .ai-composer-tools { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; color: var(--muted); font-size: 10px; }
+    .ai-composer-tools button { padding: 2px 4px; border: 0; border-radius: 3px; background: transparent; color: var(--sub); font-size: 10px; }
+    .ai-composer-tools button:hover { background: var(--soft); }
+    .ai-composer-box { display: flex; align-items: flex-end; gap: 7px; padding: 8px 8px 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); }
+    .ai-composer-box:focus-within { border-color: var(--accent); }
+    .ai-composer textarea { min-height: 35px; max-height: 90px; flex: 1; padding: 2px 0; resize: none; border: 0; outline: 0; background: transparent; color: var(--text); font: 11px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    .ai-composer textarea::placeholder { color: var(--muted); }
+    .ai-label { display: block; flex-shrink: 0; margin: 0 16px 5px; color: var(--sub); font-size: 11px; }
+    .ai-task-log { max-height: 180px; overflow-y: auto; margin: 10px 16px 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); }
+    .ai-task-title { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; color: var(--sub); font-size: 11px; font-weight: 600; }
+    .ai-running-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: ai-pulse 1.2s ease-in-out infinite; }
+    @keyframes ai-pulse { 50% { opacity: .35; } }
+    .ai-task-lines { display: grid; gap: 4px; color: var(--sub); font-size: 11px; line-height: 1.55; }
+    .ai-task-line::before { content: "✓"; margin-right: 6px; color: var(--green); }
+    .ai-result { display: flex; flex-direction: column; gap: 4px; margin: 10px 16px 0; padding: 9px 10px; border-radius: 6px; background: var(--accent-soft); color: #5c50bf; font-size: 11px; }
+    .ai-result strong { color: #5c50bf; font-size: 11px; }
+    .ai-result span { color: var(--sub); font-size: 10px; }
+    .ai-error { margin: 10px 16px 0; padding: 8px 10px; border-radius: 6px; background: #fff0ef; color: #b85555; font-size: 11px; }
+    .ai-hint { margin-top: 5px; color: var(--muted); font-size: 9px; text-align: right; }
+    .ai-footer { display: flex; align-items: center; gap: 8px; margin-top: 9px; }
+    .ai-footer .btn { height: 30px; }
+    .ai-footer .btn.danger { color: #b85555; border-color: #efc7c5; background: #fff0ef; }
+    .ai-history { display: none; min-height: 0; flex: 1; overflow: auto; padding: 14px 16px; }
+    .ai-history-title { margin-bottom: 7px; color: var(--muted); font-size: 10px; }
+    .ai-history-item { display: flex; align-items: center; gap: 8px; width: 100%; padding: 9px 0; border: 0; border-bottom: 1px solid var(--line); background: transparent; text-align: left; }
+    .ai-history-item:hover strong { color: var(--accent); }
+    .ai-history-icon { display: grid; width: 22px; height: 22px; flex: 0 0 22px; place-items: center; border-radius: 4px; background: var(--soft); color: var(--muted); font-size: 10px; }
+    .ai-history-main { min-width: 0; flex: 1; }
+    .ai-history-main strong { display: block; overflow: hidden; color: var(--text); font-size: 11px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+    .ai-history-main span { display: block; margin-top: 2px; color: var(--muted); font-size: 9px; }
+    .ai-history-status { color: var(--green); font-size: 9px; }
+    .ai-layer.history-mode .ai-config-warning, .ai-layer.history-mode .ai-conversation, .ai-layer.history-mode .ai-activity, .ai-layer.history-mode .ai-label, .ai-layer.history-mode .ai-composer { display: none; }
+    .ai-layer.history-mode .ai-history { display: block; }
+
+    /* 正式 AiOrganizeModal 的同名结构，用于确保 HTML 原型与系统实现逐项对应 */
+    .ai-assistant-backdrop { position: fixed; inset: 0; z-index: 950; display: none; background: rgba(0, 0, 0, .16); }
+    .ai-assistant-backdrop.show { display: block; }
+    .ai-assistant-panel { position: absolute; top: 0; right: 0; bottom: 0; display: flex; width: min(440px, 92vw); flex-direction: column; border-left: 1px solid var(--line); background: var(--bg); box-shadow: -12px 0 32px rgba(0, 0, 0, .16); }
+    .ai-assistant-header { flex-shrink: 0; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+    .ai-assistant-body { display: flex; min-height: 0; flex: 1; flex-direction: column; overflow: hidden; }
+    .ai-organize-header { display: flex; align-items: flex-start; justify-content: space-between; }
+    .ai-organize-title { color: var(--text); font-size: 14px; font-weight: 600; }
+    .settings-desc { margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+    .ai-assistant-body .ai-organize-tabs { flex-shrink: 0; margin: 12px 16px 0; }
+    .ai-assistant-body .ai-config-warning { flex-shrink: 0; margin: 12px 16px 0; }
+    .ai-config-warning-icon { display: grid; width: 20px; height: 20px; flex-shrink: 0; place-items: center; border-radius: 50%; color: #fff; background: var(--accent); font-size: 12px; font-weight: 700; }
+    .ai-config-warning-content { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 5px; color: var(--sub); font-size: 11px; line-height: 1.5; }
+    .ai-config-warning-content strong { color: var(--text); font-size: 12px; }
+    .ai-config-warning-actions { display: flex; gap: 7px; margin-top: 3px; }
+    .ai-config-warning-actions .btn { height: 26px; padding: 0 8px; font-size: 10px; }
+    .ai-assistant-body .ai-conversation { padding: 16px; }
+    .ai-conversation-empty { display: flex; min-height: 240px; align-items: center; justify-content: center; flex-direction: column; gap: 8px; color: var(--muted); text-align: center; font-size: 11px; }
+    .ai-conversation-empty strong { color: var(--text); font-size: 14px; }
+    .ai-conversation-empty span { max-width: 280px; line-height: 1.6; }
+    .ai-conversation-empty-icon { display: grid; width: 38px; height: 38px; place-items: center; margin-bottom: 4px; border: 1px solid var(--accent); border-radius: 12px; color: var(--accent); font-size: 20px; }
+    .ai-message-row { display: flex; width: 100%; align-items: flex-start; gap: 8px; }
+    .ai-message-row.user { justify-content: flex-end; }
+    .ai-message-avatar { display: grid; width: 24px; height: 24px; flex: 0 0 24px; place-items: center; margin-top: 2px; border: 1px solid #cfc8ff; border-radius: 6px; background: var(--accent-soft); color: var(--accent); font-size: 12px; }
+    .ai-message-row .ai-message { max-width: 88%; padding: 9px 11px; border-radius: 10px; color: var(--sub); font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; }
+    .ai-message-row.user .ai-message { border-bottom-right-radius: 3px; background: var(--accent); color: #fff; white-space: pre-wrap; }
+    .ai-message-row.assistant .ai-message { min-width: 0; border: 1px solid var(--line); border-bottom-left-radius: 3px; background: var(--soft); }
+    .ai-message-markdown p { margin: 0 0 7px; }
+    .ai-message-markdown h3 { margin: 10px 0 5px; color: var(--text); font-size: 12px; }
+    .ai-message-markdown ul { margin: 5px 0 8px; padding-left: 18px; }
+    .ai-message-markdown > :first-child { margin-top: 0; }
+    .ai-message-markdown > :last-child { margin-bottom: 0; }
+    .ai-thinking { display: inline-flex; min-height: 18px; align-items: center; gap: 4px; }
+    .ai-thinking i { width: 5px; height: 5px; border-radius: 50%; background: var(--muted); animation: ai-thinking-dot 1.15s ease-in-out infinite; }
+    .ai-thinking i:nth-child(2) { animation-delay: .14s; }.ai-thinking i:nth-child(3) { animation-delay: .28s; }
+    @keyframes ai-thinking-dot { 0%,60%,100% { opacity:.3; transform:translateY(0); } 30% { opacity:1; transform:translateY(-2px); } }
+    .ai-agent-activity { flex-shrink: 0; border: 1px solid var(--line); border-radius: 7px; background: var(--soft); color: var(--sub); }
+    .ai-agent-activity summary { display: flex; min-height: 34px; align-items: center; gap: 7px; padding: 0 10px; cursor: pointer; list-style: none; font-size: 10px; }
+    .ai-agent-activity summary::-webkit-details-marker { display: none; }
+    .ai-agent-activity summary strong { color: var(--sub); font-size: 11px; font-weight: 550; }
+    .ai-agent-activity summary .ai-action-count { margin-left: auto; color: var(--muted); }
+    .ai-agent-status-dot { width: 6px; height: 6px; flex: 0 0 6px; border-radius: 50%; background: var(--green); }
+    .ai-agent-status-dot.running { background: var(--accent); animation: ai-task-pulse 1.2s ease-in-out infinite; }
+    @keyframes ai-task-pulse { 50% { opacity: .35; } }
+    .ai-agent-actions { display: grid; max-height: 180px; gap: 4px; overflow-y: auto; padding: 8px 10px 10px; border-top: 1px solid var(--line); }
+    .ai-task-action, .ai-task-empty { display: flex; gap: 7px; color: var(--sub); font-size: 11px; line-height: 1.6; }
+    .ai-task-action > span:first-child { color: var(--green); }
+    .ai-result-summary { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid #cce5d8; border-radius: 7px; background: #f3fbf7; color: var(--sub); font-size: 10px; }
+    .ai-result-summary strong { color: var(--green); font-size: 11px; }
+    .ai-result-summary div { display: flex; flex-wrap: wrap; gap: 5px; }
+    .ai-result-summary span { padding: 2px 5px; border-radius: 4px; background: var(--bg); }
+    .ai-chat-composer { flex-shrink: 0; margin: 0 16px 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); }
+    .ai-chat-composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+    .ai-chat-composer textarea { display: block; width: 100%; min-height: 52px; max-height: 132px; padding: 9px 10px 4px; resize: none; border: 0; outline: 0; box-sizing: border-box; background: transparent; color: var(--text); font: 12px/1.55 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    .ai-chat-composer-footer { display: flex; min-height: 34px; align-items: center; gap: 8px; padding: 3px 6px 6px 10px; }
+    .ai-chat-composer-footer > span { min-width: 0; flex: 1; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+    .ai-chat-send, .ai-chat-stop { display: grid; min-width: 28px; height: 28px; place-items: center; padding: 0 8px; border: 0; border-radius: 7px; }
+    .ai-chat-send { width: 28px; padding: 0; background: var(--accent); color: #fff; font-size: 12px; }
+    .ai-chat-stop { border: 1px solid #efc7c5; background: #fff0ef; color: #b85555; font-size: 10px; }
+    .ai-chat-send:disabled, .ai-chat-stop:disabled { opacity: .42; cursor: not-allowed; }
+    .ai-task-history { display: none; min-height: 120px; max-height: 430px; flex-direction: column; gap: 6px; overflow-y: auto; padding: 12px 16px; }
+    .ai-task-history-item { display: flex; align-items: center; gap: 9px; width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--soft); color: var(--sub); text-align: left; }
+    .ai-task-history-item:hover { background: #fdfdff; border-color: #d5d5da; }
+    .ai-task-history-main { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }
+    .ai-task-history-main strong { overflow: hidden; color: var(--text); font-size: 11px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+    .ai-task-history-main small, .ai-task-history-item time { color: var(--muted); font-size: 10px; }
+    .ai-task-status { flex-shrink: 0; padding: 2px 5px; border-radius: 4px; background: #e9e9ec; color: var(--muted); font-size: 10px; }
+    .ai-task-status.running, .ai-task-status.completed { background: var(--accent-soft); color: var(--accent); }
+    .ai-task-status.cancelled, .ai-task-status.interrupted { color: var(--sub); }
+    .ai-assistant-backdrop.history-mode .ai-conversation, .ai-assistant-backdrop.history-mode .ai-config-warning, .ai-assistant-backdrop.history-mode .ai-chat-composer { display: none; }
+    .ai-assistant-backdrop.history-mode .ai-task-history { display: flex; }
+
     .settings { padding: 16px; overflow: auto; }
     .setting { padding: 13px 0; border-bottom: 1px solid var(--line); }
     .setting:first-child { padding-top: 0; }
@@ -146,7 +306,7 @@
     .setting-line { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     .link-btn { border: 0; background: transparent; color: var(--accent); }
 
-    .toast { position: fixed; z-index: 30; bottom: 45px; left: 50%; transform: translate(-50%, 10px); padding: 9px 14px; border-radius: 7px; background: #2d3036; color: #fff; opacity: 0; pointer-events: none; transition: .2s; box-shadow: var(--shadow); }
+    .toast { position: fixed; z-index: 30; bottom: 45px; left: 50%; max-width: 360px; overflow: hidden; transform: translate(-50%, 10px); padding: 9px 14px; border-radius: 7px; background: #2d3036; color: #fff; opacity: 0; pointer-events: none; text-overflow: ellipsis; white-space: nowrap; transition: .2s; box-shadow: var(--shadow); }
     .toast.show { opacity: 1; transform: translate(-50%, 0); }
 
     @media (max-width: 960px) { .right { display: none; }.sidebar { width: 220px; } }
@@ -158,7 +318,7 @@
     <nav class="toolbar">
       <div class="views"><button class="view active">✎ 编辑器</button><button class="view">⌘ 图谱</button><button class="view">⌕ 搜索</button><button class="view">♲ 回收站</button></div>
       <div class="crumb">收件箱　/　产品构想</div>
-      <div class="tools"><button class="icon-btn">＋</button><button class="icon-btn">⇧</button><button class="icon-btn" id="openSettings">⚙</button></div>
+      <div class="tools"><button class="icon-btn">＋</button><button class="icon-btn">⇧</button><button class="icon-btn" id="openAi" title="AI 助手">✦</button><button class="icon-btn" id="openSettings">⚙</button></div>
     </nav>
 
     <div class="body">
@@ -185,8 +345,8 @@
           <div class="tab active">▤ <span>产品构想</span> ×</div>
           <button class="close-all">× 关闭全部</button>
         </div>
-        <div class="editor-head"><strong>产品构想</strong><div class="mode"><button class="active">编辑</button><button>预览</button><button>已保存</button></div></div>
-        <article class="editor"><h1>产品构想</h1><p># KBOX 文件发现</p><p>定期查看授权目录中的新文件，由用户批量选择后添加到知识库。</p><p>原则：不自动入库、不移动源文件、不扫描未授权目录。</p></article>
+        <div class="editor-head"><strong>产品构想</strong><div class="mode"><button class="active">编辑</button><button>源码</button><button>预览</button><button>已保存</button></div></div>
+        <article class="editor" contenteditable="true" spellcheck="true"><h1>产品构想</h1><h2>KBOX 文件发现</h2><p>定期查看授权目录中的新文件，由用户批量选择后添加到知识库。</p><ul><li>不自动入库</li><li>不移动源文件</li><li>不扫描未授权目录</li></ul></article>
       </main>
 
       <aside class="right">
@@ -230,6 +390,19 @@
     </section>
   </div>
 
+  <div class="ai-assistant-backdrop" id="aiLayer">
+    <aside class="ai-assistant-panel" role="dialog" aria-modal="true" aria-label="KBOX AI 助手">
+      <div class="ai-assistant-header ai-organize-header"><div><div class="ai-organize-title">✦ KBOX AI 助手</div><div class="settings-desc" id="aiScopeText">通过对话检索、整理和维护知识库；只有发送后才会调用模型</div></div><button class="icon-btn" id="closeAi" aria-label="关闭">×</button></div>
+      <div class="ai-assistant-body ai-organize-body">
+        <div class="ai-organize-tabs"><button class="active" data-ai-tab="conversation">当前任务</button><button data-ai-tab="history">历史记录</button></div>
+        <div class="ai-config-warning" id="aiConfigWarning" role="status" hidden><div class="ai-config-warning-icon">!</div><div class="ai-config-warning-content"><strong>需要先配置 AI</strong><span>请先在设置中选择模型服务并配置接口地址、模型和认证信息，配置完成后才能使用整理、检索和维护功能。</span><div class="ai-config-warning-actions"><button class="btn primary" id="openAiSettings" type="button">打开设置</button><button class="btn" id="recheckAi" type="button">重新检查</button></div></div></div>
+        <div class="ai-conversation" id="aiConversation" aria-live="polite"><div class="ai-conversation-empty" id="aiEmpty"><div class="ai-conversation-empty-icon">✦</div><strong>有什么可以帮你？</strong><span>可以检索、分析并使用工具整理知识库，也可以基于上一轮结果继续追问。</span></div><details class="ai-agent-activity" id="aiActivity" hidden><summary><span class="ai-agent-status-dot" id="aiRunningDot"></span><strong id="aiTaskTitle">Agent 执行记录</strong><span class="ai-action-count" id="aiActionCount">准备工具</span></summary><div class="ai-agent-actions" id="aiTaskLines"></div></details><div class="ai-result-summary" id="aiResult" hidden><strong>任务完成</strong><div id="aiResultMeta"><span>目录 0</span><span>移动 0</span><span>归档 0</span><span>清理 0</span></div></div><div class="editor-ai-error" id="aiError" hidden></div></div>
+        <div class="ai-task-history" id="aiHistory" hidden><button class="ai-task-history-item"><span class="ai-task-status completed">已完成</span><span class="ai-task-history-main"><strong>整理当前知识库的目录结构</strong><small>整个知识库 · DeepSeek</small></span><time>今天 14:32</time></button><button class="ai-task-history-item"><span class="ai-task-status completed">已完成</span><span class="ai-task-history-main"><strong>查找重复的车载以太网手册</strong><small>整个知识库 · DeepSeek</small></span><time>昨天 18:06</time></button><button class="ai-task-history-item"><span class="ai-task-status cancelled">已停止</span><span class="ai-task-history-main"><strong>为 MCP 协议相关对象建立关系</strong><small>通信协议目录 · DeepSeek</small></span><time>8 月 27 日</time></button></div>
+        <div class="ai-chat-composer"><textarea id="aiPrompt" rows="2" placeholder="继续对话，或告诉 Agent 下一步做什么…"></textarea><div class="ai-chat-composer-footer"><span>范围：整个知识库 · ⌘↵ 发送</span><button class="ai-chat-send" id="aiSubmit" type="button" aria-label="发送">↑</button><button class="ai-chat-stop" id="aiStop" type="button" hidden>停止</button></div></div>
+      </div>
+    </aside>
+  </div>
+
   <div class="toast" id="toast"></div>
   <script>
     const discoveryModal = document.getElementById('discoveryModal');
@@ -265,6 +438,62 @@
     };
     importBtn.onclick = () => { const count = checks.filter(c => c.checked).length; close(discoveryModal); say(`已添加 ${count} 个文件（原型）`); };
     document.getElementById('saveSettings').onclick = () => { close(settingsModal); say('扫描设置已保存（原型）'); };
+
+    // AI 助手交互（原型）：对应 AiOrganizeModal 的空状态、执行、停止和结果状态。
+    const aiLayer = document.getElementById('aiLayer');
+    const aiConversation = document.getElementById('aiConversation');
+    const aiEmpty = document.getElementById('aiEmpty');
+    const aiHistory = document.getElementById('aiHistory');
+    const aiPrompt = document.getElementById('aiPrompt');
+    const aiActivity = document.getElementById('aiActivity');
+    const aiTaskTitle = document.getElementById('aiTaskTitle');
+    const aiRunningDot = document.getElementById('aiRunningDot');
+    const aiTaskLines = document.getElementById('aiTaskLines');
+    const aiActionCount = document.getElementById('aiActionCount');
+    const aiResult = document.getElementById('aiResult');
+    const aiResultMeta = document.getElementById('aiResultMeta');
+    const aiError = document.getElementById('aiError');
+    const aiSubmit = document.getElementById('aiSubmit');
+    const aiStop = document.getElementById('aiStop');
+    const aiConfigWarning = document.getElementById('aiConfigWarning');
+    const aiTabs = [...document.querySelectorAll('.ai-organize-tabs button')];
+    let aiRunning = false;
+    let aiTimer;
+    const aiConfigured = !new URLSearchParams(location.search).has('unconfigured');
+    if (!aiConfigured) { aiConfigWarning.hidden = false; aiPrompt.disabled = true; aiSubmit.disabled = true; aiPrompt.placeholder = '完成模型服务配置后即可发送指令'; }
+    const setAiMode = (mode) => { const historyMode = mode === 'history'; aiLayer.classList.toggle('history-mode', historyMode); aiHistory.hidden = !historyMode; aiTabs.forEach(tab => tab.classList.toggle('active', tab.dataset.aiTab === mode)); };
+    const addAiMessage = (role, text, rich = false) => {
+      const row = document.createElement('div'); row.className = `ai-message-row ${role}`;
+      if (role === 'assistant') { const avatar = document.createElement('div'); avatar.className = 'ai-message-avatar'; avatar.textContent = '✦'; row.appendChild(avatar); }
+      const message = document.createElement('div'); message.className = `ai-message ${role}`;
+      if (rich) { const body = document.createElement('div'); body.className = 'ai-message-markdown'; body.innerHTML = text; message.appendChild(body); } else { message.textContent = text; }
+      row.appendChild(message); aiConversation.insertBefore(row, aiActivity); aiConversation.scrollTop = aiConversation.scrollHeight;
+      return message;
+    };
+    const resetAiTask = () => { clearTimeout(aiTimer); aiRunning = false; aiActivity.hidden = true; aiActivity.open = false; aiResult.hidden = true; aiError.hidden = true; aiRunningDot.classList.remove('running'); aiSubmit.hidden = false; aiStop.hidden = true; aiTaskLines.replaceChildren(); aiActionCount.textContent = '准备工具'; };
+    document.getElementById('openAi').onclick = () => { aiLayer.classList.add('show'); setAiMode('conversation'); if (aiConfigured) aiPrompt.focus(); };
+    const closeAi = () => { aiLayer.classList.remove('show'); };
+    document.getElementById('closeAi').onclick = closeAi;
+    document.getElementById('openAiSettings').onclick = () => { closeAi(); open(settingsModal); };
+    document.getElementById('recheckAi').onclick = () => say('请先在设置中完成模型服务配置');
+    aiLayer.onclick = event => { if (event.target === aiLayer) closeAi(); };
+    aiTabs.forEach(tab => tab.onclick = () => setAiMode(tab.dataset.aiTab));
+    aiHistory.querySelectorAll('.ai-task-history-item').forEach(item => item.onclick = () => {
+      setAiMode('conversation'); aiEmpty.hidden = true; aiConversation.querySelectorAll('.ai-message-row').forEach(message => message.remove());
+      addAiMessage('user', item.querySelector('strong').textContent);
+      addAiMessage('assistant', `<p>历史任务已${item.querySelector('.ai-task-status').textContent}。</p><p>${item.querySelector('time').textContent}</p>`, true);
+    });
+    const submitAi = () => {
+      const value = aiPrompt.value.trim();
+      if (!value || aiRunning || !aiConfigured) return;
+      aiRunning = true; aiEmpty.hidden = true; aiResult.hidden = true; aiError.hidden = true;
+      addAiMessage('user', value); const pending = addAiMessage('assistant', '', false); pending.innerHTML = '<span class="ai-thinking"><i></i><i></i><i></i></span>'; aiPrompt.value = '';
+      aiActivity.hidden = false; aiActivity.open = true; aiTaskTitle.textContent = 'Agent 正在执行'; aiRunningDot.classList.add('running'); aiSubmit.hidden = true; aiStop.hidden = false;
+      aiTimer = setTimeout(() => { ['搜索相关知识对象', '读取 3 篇笔记', '建立「技术资料」目录'].forEach(item => { const line = document.createElement('div'); line.className = 'ai-task-action'; line.innerHTML = `<span>✓</span><span>${item}</span>`; aiTaskLines.appendChild(line); }); aiActionCount.textContent = '3 个动作'; aiTaskTitle.textContent = 'Agent 执行记录'; aiRunningDot.classList.remove('running'); aiRunning = false; aiSubmit.hidden = false; aiStop.hidden = true; aiActivity.open = false; aiResult.hidden = false; aiResultMeta.innerHTML = '<span>目录 1</span><span>移动 3</span><span>归档 0</span><span>清理 0</span>'; pending.innerHTML = '<div class="ai-message-markdown"><h3>整理已完成</h3><p>我已建立「技术资料」目录，并将 3 篇相关笔记移入。</p><ul><li>原文内容没有修改</li><li>可以继续追问或调整目录</li></ul></div>'; }, 900);
+    };
+    aiSubmit.onclick = submitAi;
+    document.getElementById('aiStop').onclick = () => { if (!aiRunning) return; clearTimeout(aiTimer); aiRunning = false; aiTaskTitle.textContent = 'Agent 执行记录'; aiRunningDot.classList.remove('running'); aiSubmit.hidden = false; aiStop.hidden = true; aiActionCount.textContent = '已停止'; addAiMessage('assistant', '任务已停止，已完成的动作保持不变。'); };
+    aiPrompt.addEventListener('keydown', event => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); submitAi(); } });
   </script>
 </body>
 </html>

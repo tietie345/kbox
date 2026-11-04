@@ -38,7 +38,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   return (
     <ToastContext.Provider value={{ toast }}>
       {children}
-      <div className="toast-container">
+      <div className="toast-container" aria-live="polite" aria-atomic="false">
         {toasts.map((t) => (
           <ToastView key={t.id} item={t} onClose={() => remove(t.id)} />
         ))}
@@ -68,7 +68,7 @@ function ToastView({ item, onClose }: { item: ToastItem; onClose: () => void }) 
   return (
     <div className={`toast ${item.type}`} onClick={onClose}>
       <span className="toast-icon">{icon()}</span>
-      <span>{item.message}</span>
+      <span className="toast-message" title={item.message}>{item.message}</span>
     </div>
   );
 }
